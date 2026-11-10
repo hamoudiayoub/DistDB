@@ -1,0 +1,127 @@
+// The KV API that clients use to reach a node.
+//
+// One method carries a union of operations, as CockroachDB's Batch RPC does, so deadlines, retries,
+// idempotency and errors are handled in one place on each side. Deadlines travel as gRPC
+// deadlines (the grpc-timeout header), not as fields here.
+syntax = "proto3";
+
+package distdb.kv.v1;
+
+option java_package = "io.distdb.rpc.proto";
+option java_multiple_files = true;
+option java_outer_classname = "KvProto";
+
+service Kv {
+  rpc Call(KvRequest) returns (KvResponse);
+}
+
+// Names one write, so that a retry of it is answered from the server's record instead of being
+// applied a second time.
+message RequestId {
+  // 16 random bytes, chosen once when the client starts.
+  bytes client_id = 1;
+  // Starts at 1 and increases by one for each write this client issues; a retry reuses it.
+  uint64 seq = 2;
+}
+
+message KvRequest {
+  // Set on writes. Reads change nothing, so repeating one is harmless and they carry no id.
+  RequestId request_id = 1;
+  // On writes: the lowest seq this client is still waiting for. Every seq below it has its
+  // answer, so the server may forget those results and must reject any late copy of them.
+  uint64 first_incomplete_seq = 2;
+
+  oneof op {
+    GetRequest get = 10;
+    PutRequest put = 11;
+    DeleteRequest delete = 12;
+    ScanRequest scan = 13;
+  }
+}
+
+message GetRequest {
+  bytes key = 1;
+}
+
+message PutRequest {
+  bytes key = 1;
+  bytes value = 2;
+}
+
+message DeleteRequest {
+  bytes key = 1;
+}
+
+// Returns one page of [start_key, end_key) in key order. Each page is a consistent snapshot;
+// successive pages are not one snapshot (that arrives with MVCC timestamps in Phase 7).
+message ScanRequest {
+  bytes start_key = 1;
+  // Exclusive. Absent means no upper bound.
+  optional bytes end_key = 2;
+  // At most this many entries; 0 means the server's default. The server may return fewer.
+  uint32 limit = 3;
+}
+
+message KvResponse {
+  oneof result {
+    Error error = 1;
+    GetResponse get = 10;
+    PutResponse put = 11;
+    DeleteResponse delete = 12;
+    ScanResponse scan = 13;
+  }
+}
+
+message GetResponse {
+  bool found = 1;
+  bytes value = 2;
+}
+
+message PutResponse {}
+
+message DeleteResponse {}
+
+message ScanResponse {
+  repeated KeyValue entries = 1;
+  // Present if the page stopped before end_key: send the same scan again starting here.
+  optional bytes resume_key = 2;
+}
+
+message KeyValue {
+  bytes key = 1;
+  bytes value = 2;
+}
+
+// Errors the server decided on. Each kind tells the client exactly what to do next, which is why
+// they are typed rather than strings. Apart from StorageFailure.maybe_applied, this attempt
+// changed nothing. (NotLeader, RangeNotFound, EpochMismatch and KeyLocked join in Phases 5 to 7.)
+message Error {
+  oneof kind {
+    // Too many requests in flight. Retry after a backoff.
+    ServerBusy server_busy = 1;
+    // The deadline had passed before the server started the work. Retry only if time is left.
+    DeadlineExceeded deadline_exceeded = 2;
+    // The request itself is wrong (key too long, missing operation, ...). Never retry.
+    InvalidArgument invalid_argument = 3;
+    // The storage engine stopped after an I/O error; the node is restarting. Retry.
+    StorageFailure storage_failure = 4;
+    // A late copy of a write whose answer the client already has. A correct client never
+    // sees this: only a stray duplicate of an old attempt gets it.
+    StaleRequest stale_request = 5;
+  }
+  string message = 15;
+}
+
+message ServerBusy {}
+
+message DeadlineExceeded {}
+
+message InvalidArgument {}
+
+message StorageFailure {
+  // True if the failure struck while this write was going to disk. The write may then have
+  // reached the disk anyway (only the fsync failed, say) and will reappear after the restart.
+  bool maybe_applied = 1;
+}
+
+message StaleRequest {}

@@ -1,0 +1,10 @@
+.gradle/
+build/
+.kotlin/
+.jqwik-database
+*.iml
+.idea/
+.vscode/
+out/
+*.log
+bin/
