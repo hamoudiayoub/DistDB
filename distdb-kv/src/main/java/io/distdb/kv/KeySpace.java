@@ -33,6 +33,21 @@ public final class KeySpace {
 
   static final byte RAFT_SNAPSHOT = 'P';
 
+  /** {@code 'A' group}: the index of the last log entry applied to the data. */
+  static final byte APPLIED = 'A';
+
+  /**
+   * The ranges of the replicated state machine: client data, plus client sessions and their results
+   * ({@code 'r'} and {@code 's'} are adjacent). Everything else in the local space (Raft logs, the
+   * applied index) belongs to this node alone.
+   */
+  static byte[][][] replicatedRanges() {
+    return new byte[][][] {
+      {{USER}, {USER + 1}},
+      {local(RESULT), local((byte) (SESSION + 1))},
+    };
+  }
+
   private KeySpace() {}
 
   /** The engine key holding client key {@code key}. */

@@ -3,7 +3,7 @@ package io.distdb.kv;
 import java.time.Duration;
 
 /**
- * Limits and timings for a {@link KvService}.
+ * Limits and timings for a {@link ReplicatedKv}.
  *
  * @param maxKeyBytes the longest key a client may write
  * @param maxValueBytes the longest value a client may write

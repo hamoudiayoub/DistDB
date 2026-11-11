@@ -13,6 +13,7 @@ public final class Life implements Scheduler {
 
   private final Scheduler shared;
   private boolean alive = true;
+  private long stretch = 1;
 
   public Life(Scheduler shared) {
     this.shared = Objects.requireNonNull(shared);
@@ -27,6 +28,18 @@ public final class Life implements Scheduler {
     return alive;
   }
 
+  /**
+   * Makes this process's timers run {@code factor} times slower (1 is normal): a stalled process,
+   * as a long GC pause or an overloaded machine makes one. Its sense of elapsed time falls behind
+   * everyone else's.
+   */
+  public void stall(long factor) {
+    if (factor < 1) {
+      throw new IllegalArgumentException("factor must be at least 1: " + factor);
+    }
+    stretch = factor;
+  }
+
   @Override
   public void execute(Runnable task) {
     shared.execute(() -> runIfAlive(task));
@@ -34,7 +47,7 @@ public final class Life implements Scheduler {
 
   @Override
   public Cancellable schedule(Duration delay, Runnable task) {
-    return shared.schedule(delay, () -> runIfAlive(task));
+    return shared.schedule(delay.multipliedBy(stretch), () -> runIfAlive(task));
   }
 
   private void runIfAlive(Runnable task) {

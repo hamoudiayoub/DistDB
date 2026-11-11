@@ -108,8 +108,19 @@ message Error {
     // A late copy of a write whose answer the client already has. A correct client never
     // sees this: only a stray duplicate of an old attempt gets it.
     StaleRequest stale_request = 5;
+    // This node is not the Raft leader. Retry at the leader it names, or at another node.
+    NotLeader not_leader = 6;
   }
   string message = 15;
+}
+
+message NotLeader {
+  // The leader this node knows of; 0 and empty if it knows none.
+  uint32 leader_id = 1;
+  string leader_address = 2;
+  // True if this node had already proposed the write before it lost the leadership: the
+  // entry may still commit under the next leader.
+  bool maybe_applied = 3;
 }
 
 message ServerBusy {}

@@ -76,15 +76,17 @@ final class KvCommand {
           default -> throw new Args.UsageException("unknown operation " + op);
         };
 
-    try (GrpcKvChannel channel = GrpcKvChannel.connect(server);
-        ExecutorScheduler scheduler = new ExecutorScheduler()) {
-      KvClient client =
-          new KvClient(
-              channel,
-              SystemClock.INSTANCE,
-              scheduler,
-              SplittableRandomSource.fromEntropy(),
-              ClientOptions.defaults().withDefaultTimeout(timeout));
+    // Any member will do: the client follows redirects to the leader.
+    List<String> seeds = List.of(server.split(","));
+    try (ExecutorScheduler scheduler = new ExecutorScheduler();
+        KvClient client =
+            new KvClient(
+                seeds,
+                GrpcKvChannel::connect,
+                SystemClock.INSTANCE,
+                scheduler,
+                SplittableRandomSource.fromEntropy(),
+                ClientOptions.defaults().withDefaultTimeout(timeout))) {
       return operation.run(client);
     } catch (KvException e) {
       err.println("error: " + e.getMessage());

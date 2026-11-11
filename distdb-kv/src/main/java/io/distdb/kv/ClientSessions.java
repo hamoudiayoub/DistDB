@@ -95,11 +95,13 @@ final class ClientSessions {
   }
 
   /**
-   * Forgets every session idle for longer than {@code ttl} at wall time {@code nowMillis}.
+   * Adds to {@code batch} the deletion of every session idle for longer than {@code ttl} at time
+   * {@code nowMillis}. In a replicated group the time comes from the log, never from the local
+   * clock, so every replica forgets the same sessions.
    *
    * @return how many were forgotten
    */
-  int expire(long nowMillis, Duration ttl) {
+  int expire(WriteBatch batch, long nowMillis, Duration ttl) {
     List<byte[]> expired = new ArrayList<>();
     byte[] start = KeySpace.local(KeySpace.SESSION);
     byte[] end = KeySpace.local((byte) (KeySpace.SESSION + 1));
@@ -112,10 +114,6 @@ final class ClientSessions {
         }
       }
     }
-    if (expired.isEmpty()) {
-      return 0;
-    }
-    WriteBatch batch = new WriteBatch();
     for (byte[] clientId : expired) {
       batch.delete(sessionKey(clientId));
       byte[] prefix = KeySpace.local(KeySpace.RESULT, clientId);
@@ -123,8 +121,6 @@ final class ClientSessions {
         batch.delete(key);
       }
     }
-    // No need to sync: if the deletions are lost in a crash, the next sweep makes them again.
-    engine.write(batch, false);
     return expired.size();
   }
 

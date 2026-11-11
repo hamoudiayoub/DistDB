@@ -20,15 +20,22 @@ import io.distdb.rpc.proto.ScanResponse;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.TreeSet;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Function;
 
 /**
- * A client of one KV node. Every call has a deadline; within it, the client retries whatever is
+ * A client of a KV group. Every call has a deadline; within it, the client retries whatever is
  * worth retrying, with exponential backoff and jitter, and gives up with a {@link KvException}.
+ *
+ * <p>It sends to the node it believes leads. A {@code NotLeader} answer names the real leader, if
+ * the node knows it, and the client goes straight there; a node that does not answer, or knows no
+ * leader, makes the client try the next of its seed addresses.
  *
  * <p>Retrying a write is safe because each write carries a request id (this client's random id and
  * a sequence number) that stays the same across its retries, so the server applies it at most once.
@@ -37,14 +44,18 @@ import java.util.concurrent.CompletionException;
  * failed while writing.
  *
  * <p>Thread-safe and non-blocking: calls return futures, and backoff waits are timers on the {@link
- * Scheduler}, so the simulator can run the client deterministically. The client does not own the
- * channel; close that separately.
+ * Scheduler}, so the simulator can run the client deterministically. {@link #close()} closes the
+ * channels it opened; a channel passed in directly stays the caller's.
  */
-public final class KvClient {
+public final class KvClient implements AutoCloseable {
 
   private static final int CLIENT_ID_BYTES = 16;
 
-  private final KvChannel channel;
+  private final List<String> seeds;
+  private final Function<String, KvChannel> connect;
+  private final boolean ownsChannels;
+  private final Map<String, KvChannel> channels = new ConcurrentHashMap<>();
+  private volatile String target;
   private final Clock clock;
   private final Scheduler scheduler;
   private final RandomSource random; // guarded by itself
@@ -55,13 +66,47 @@ public final class KvClient {
   private long nextSeq = 1; // guarded by seqLock
   private final TreeSet<Long> incomplete = new TreeSet<>(); // guarded by seqLock
 
+  /** A client of a single node, over a channel the caller owns. */
   public KvClient(
       KvChannel channel,
       Clock clock,
       Scheduler scheduler,
       RandomSource random,
       ClientOptions options) {
-    this.channel = Objects.requireNonNull(channel);
+    this(List.of("node"), address -> channel, false, clock, scheduler, random, options);
+  }
+
+  /**
+   * A client of a group.
+   *
+   * @param seeds addresses to start from; any member will do, it redirects to the leader
+   * @param connect opens a channel to an address (seeds, and leaders named in redirects)
+   */
+  public KvClient(
+      List<String> seeds,
+      Function<String, KvChannel> connect,
+      Clock clock,
+      Scheduler scheduler,
+      RandomSource random,
+      ClientOptions options) {
+    this(seeds, connect, true, clock, scheduler, random, options);
+  }
+
+  private KvClient(
+      List<String> seeds,
+      Function<String, KvChannel> connect,
+      boolean ownsChannels,
+      Clock clock,
+      Scheduler scheduler,
+      RandomSource random,
+      ClientOptions options) {
+    if (seeds.isEmpty()) {
+      throw new IllegalArgumentException("at least one seed address is needed");
+    }
+    this.seeds = List.copyOf(seeds);
+    this.connect = Objects.requireNonNull(connect);
+    this.ownsChannels = ownsChannels;
+    this.target = this.seeds.getFirst();
     this.clock = Objects.requireNonNull(clock);
     this.scheduler = Objects.requireNonNull(scheduler);
     this.random = Objects.requireNonNull(random);
@@ -74,6 +119,35 @@ public final class KvClient {
   /** This client's id, which the server uses to recognize its retries. */
   public byte[] clientId() {
     return clientId.toByteArray();
+  }
+
+  /** The address the client currently believes leads (where the next request goes). */
+  public String leader() {
+    return target;
+  }
+
+  /** Closes the channels this client opened. */
+  @Override
+  public void close() {
+    if (ownsChannels) {
+      channels.values().forEach(KvChannel::close);
+    }
+    channels.clear();
+  }
+
+  private KvChannel channel(String address) {
+    return channels.computeIfAbsent(address, connect);
+  }
+
+  /** After {@code failed} did not help, move on to the next seed (unless someone already did). */
+  private void moveOn(String failed) {
+    int i = seeds.indexOf(failed);
+    String next = seeds.get((i + 1) % seeds.size());
+    synchronized (this) {
+      if (target.equals(failed)) {
+        target = next;
+      }
+    }
   }
 
   // -----------------------------------------------------------------------------------------------
@@ -222,8 +296,10 @@ public final class KvClient {
     // Touched by one attempt's callback at a time; each hands over to the next through a future or
     // a timer, which orders the accesses.
     private int attempts;
+    private int redirects;
     private boolean outcomeUnknown;
     private String lastFailure = "none";
+    private String sentTo;
 
     Call(KvRequest request, boolean write, long deadline) {
       this.request = request;
@@ -247,8 +323,9 @@ public final class KvClient {
       KvRequest r = write ? request.toBuilder().setFirstIncompleteSeq(floor()).build() : request;
       Duration timeout = Duration.ofNanos(Math.min(remaining, options.attemptTimeout().toNanos()));
       CompletableFuture<KvResponse> answer;
+      sentTo = target;
       try {
-        answer = channel.call(r, timeout);
+        answer = channel(sentTo).call(r, timeout);
       } catch (RuntimeException e) {
         answer = CompletableFuture.failedFuture(e);
       }
@@ -267,6 +344,7 @@ public final class KvClient {
         outcomeUnknown |= write && maybeDelivered;
         lastFailure = String.valueOf(cause.getMessage());
         if (cause instanceof RpcException e && e.kind().retryable()) {
+          moveOn(sentTo); // that node may be down; another may lead now
           retryLater();
         } else {
           fail(KvException.Code.INTERNAL, "call failed: " + cause, cause);
@@ -286,6 +364,21 @@ public final class KvClient {
         case STORAGE_FAILURE -> {
           outcomeUnknown |= write && error.getStorageFailure().getMaybeApplied();
           retryLater(); // the node restarts, and a retry is recognized if the write survived
+        }
+        case NOT_LEADER -> {
+          // Proposed by a leader that then lost the leadership: it may still commit.
+          outcomeUnknown |= write && error.getNotLeader().getMaybeApplied();
+          String hint = error.getNotLeader().getLeaderAddress();
+          if (!hint.isEmpty() && !hint.equals(sentTo) && redirects < seeds.size() + 2) {
+            redirects++;
+            synchronized (KvClient.this) {
+              target = hint;
+            }
+            attempt(); // straight to the leader it named
+          } else {
+            moveOn(sentTo); // it knows no leader (an election is on): try elsewhere, later
+            retryLater();
+          }
         }
         case INVALID_ARGUMENT -> fail(KvException.Code.INVALID_ARGUMENT, error.getMessage(), null);
         case STALE_REQUEST, KIND_NOT_SET ->

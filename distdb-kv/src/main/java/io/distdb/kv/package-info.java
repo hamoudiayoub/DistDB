@@ -1,6 +1,6 @@
 /**
- * The KV server. In Phase 3 it is one node serving one {@link io.distdb.storage.KvEngine} ({@link
- * io.distdb.kv.KvService}); from Phase 5 it hosts Raft replicas of ranges and applies their
- * committed entries.
+ * The KV server. {@link io.distdb.kv.ReplicatedKv} is one replica of a Raft group: writes go
+ * through the replicated log and are applied by {@link io.distdb.kv.KvStateMachine}; reads are
+ * linearizable through ReadIndex. A single node is a group of one.
  */
 package io.distdb.kv;

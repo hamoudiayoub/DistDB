@@ -92,6 +92,17 @@ public final class SimNetwork {
     partition(Set.of(id));
   }
 
+  /**
+   * Cuts only the links between {@code a} and each of {@code others}; theirs to anyone else stay.
+   */
+  public void cut(NodeId a, Collection<NodeId> others) {
+    for (NodeId b : others) {
+      if (!a.equals(b)) {
+        blocked.add(link(a, b));
+      }
+    }
+  }
+
   /** Restores every link. */
   public void heal() {
     blocked.clear();

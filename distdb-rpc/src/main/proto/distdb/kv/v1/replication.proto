@@ -1,0 +1,49 @@
+// What a replicated KV group puts in its Raft log, and how nodes send each other Raft messages.
+syntax = "proto3";
+
+package distdb.kv.v1;
+
+import "distdb/kv/v1/kv.proto";
+
+option java_package = "io.distdb.rpc.proto";
+option java_multiple_files = true;
+option java_outer_classname = "ReplicationProto";
+
+// One entry of the replicated log. Every replica applies the same commands in the same order, so
+// applying one must depend on nothing but the command and the replica's state: no local clock,
+// no randomness. That is why times travel inside commands.
+message Command {
+  oneof kind {
+    WriteCommand write = 1;
+    ExpireSessions expire_sessions = 2;
+  }
+}
+
+message WriteCommand {
+  // A Put or Delete, with its request id.
+  KvRequest request = 1;
+  // The proposing leader's wall clock. Client sessions age by this log time, so every replica
+  // expires the same sessions at the same index.
+  int64 propose_time_millis = 2;
+}
+
+// Forget client sessions idle since before now_millis - ttl_millis (log time, not local time).
+message ExpireSessions {
+  int64 now_millis = 1;
+  int64 ttl_millis = 2;
+}
+
+// Raft messages between nodes: one long-lived stream per peer, fire and forget. Raft tolerates
+// lost messages, so a broken stream is simply reopened.
+service RaftTransport {
+  rpc Send(stream RaftFrame) returns (RaftAck);
+}
+
+message RaftFrame {
+  uint32 from = 1;
+  uint32 to = 2;
+  // A message encoded by io.distdb.raft.RaftCodec.
+  bytes message = 3;
+}
+
+message RaftAck {}

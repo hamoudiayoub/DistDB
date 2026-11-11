@@ -150,3 +150,44 @@ One entry per bug that took more than an hour: symptom, root cause, what it taug
 - **Workaround:** a wrapper that retries the build, clearing `build-logic/build` (pure output)
   when the collision happens. The real fix is to stop the IDE building at the same time, or to
   give it its own build directory.
+
+---
+
+## 2026-11-11 — A lease-read bug the simulator could not see, until clocks could stall
+
+- **Symptom:** to test the Phase 5 gate, I made the leader serve reads from its local state
+  without ReadIndex's heartbeat round (a lease read with no lease). The linearizability checker
+  passed 100 seeds, and then 100 more with per-node clock drift.
+- **Cause:** a stale read needs a deposed leader that still believes it leads while a new leader
+  commits a write. In the simulator, check-quorum always deposed the old leader within its own 10
+  to 20 ticks, before the others (who wait at least as long, then run pre-vote) could elect
+  anyone. Client timing narrowed the window further: the competing write first timed out at the
+  old leader. With clocks that run at the same rate, the lease is safe, which is exactly the
+  assumption lease reads rely on.
+- **Fix (to the simulator):** two faults that real systems have:
+  - stalled processes, whose timers run 4–8 times slow for a while, like a long GC pause;
+  - a partition that cuts the leader off from its peers but not from its clients.
+
+  The checker then caught the bug on seed 7, with a read that returned a value already
+  overwritten by a completed write. The correct code (ReadIndex) passes, because it never trusts
+  time.
+- **Lesson:** a simulator only finds bugs in the failure modes it models. "Clocks are perfect" is
+  a hidden assumption, and the most dangerous kind, since some correctness arguments (leases)
+  depend on it. When a planted bug survives, ask what the world is missing, not whether the bug
+  is real.
+
+---
+
+## 2026-11-11 — One lost message ate a client's whole deadline
+
+- **Symptom:** the failover benchmark failed liveness: after the faults stopped, one client did
+  nothing for 3 seconds while the cluster was healthy and the other client worked.
+- **Cause:** found by tracing that client's attempts. Its per-attempt timeout (2 s) equalled its
+  deadline (2 s). One request to a follower was lost (2% loss), so that single attempt waited out
+  the entire deadline. That happened twice in a row, which covered the quiet period. A first
+  suspicion turned out wrong: an exception swallowed inside a future callback, which would also
+  have silenced the client. The harness now records those, so it can't happen unnoticed.
+- **Fix:** attempts much shorter than the deadline (400 ms within 2 s in the simulator; the
+  production defaults are 2 s within 5 s).
+- **Lesson:** retrying needs time left to retry in. The ratio of attempt timeout to deadline is a
+  real design parameter, not a default to leave alone.

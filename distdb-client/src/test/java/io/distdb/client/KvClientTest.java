@@ -227,6 +227,75 @@ class KvClientTest {
   }
 
   // ---------------------------------------------------------------------------------------------
+  // A group of nodes
+
+  @Test
+  void aRedirectSendsTheRequestStraightToTheNamedLeader() {
+    Map<String, ScriptedChannel> nodes = group("a", "b", "c");
+    nodes.get("a").script(respond(KvErrors.notLeader(3, "c", false, "not me")));
+    nodes.get("c").script(respond(PUT_OK));
+    KvClient c = groupClient(nodes);
+    CompletableFuture<Void> put = c.put(utf8("k"), utf8("v"));
+    scheduler.runUntilIdle();
+    put.join();
+    assertThat(nodes.get("a").sent).hasSize(1);
+    assertThat(nodes.get("b").sent).isEmpty();
+    assertThat(nodes.get("c").sent).hasSize(1);
+    assertThat(c.leader()).isEqualTo("c");
+    assertThat(clock.nanoTime()).as("no backoff for a redirect").isZero();
+  }
+
+  @Test
+  void aDeadOrLeaderlessNodeSendsTheClientToTheNextOne() {
+    Map<String, ScriptedChannel> nodes = group("a", "b", "c");
+    nodes.get("a").script(unavailable());
+    nodes.get("b").script(respond(KvErrors.notLeader(0, "", false, "election in progress")));
+    nodes.get("c").script(respond(PUT_OK));
+    KvClient c = groupClient(nodes);
+    CompletableFuture<Void> put = c.put(utf8("k"), utf8("v"));
+    scheduler.runUntilIdle();
+    put.join();
+    assertThat(c.leader()).isEqualTo("c");
+    assertThat(
+            nodes.values().stream()
+                .flatMap(n -> n.sent.stream())
+                .map(s -> s.request.getRequestId())
+                .distinct())
+        .as("one request id across every node")
+        .hasSize(1);
+  }
+
+  @Test
+  void aWriteProposedBeforeTheLeaderLostOfficeHasAnUnknownOutcome() {
+    Map<String, ScriptedChannel> nodes = group("a", "b");
+    nodes.get("a").script(respond(KvErrors.notLeader(2, "b", true, "lost the leadership")));
+    nodes.get("a").otherwise(respond(KvErrors.serverBusy("busy")));
+    nodes.get("b").otherwise(respond(KvErrors.serverBusy("busy")));
+    KvClient c = groupClient(nodes);
+    CompletableFuture<Void> put = c.put(utf8("k"), utf8("v"), Duration.ofSeconds(1));
+    scheduler.runUntilIdle();
+    assertThat(failure(put).outcomeUnknown()).isTrue();
+  }
+
+  private Map<String, ScriptedChannel> group(String... addresses) {
+    Map<String, ScriptedChannel> nodes = new java.util.LinkedHashMap<>();
+    for (String a : addresses) {
+      nodes.put(a, new ScriptedChannel());
+    }
+    return nodes;
+  }
+
+  private KvClient groupClient(Map<String, ScriptedChannel> nodes) {
+    return new KvClient(
+        List.copyOf(nodes.keySet()),
+        nodes::get,
+        clock,
+        scheduler,
+        SplittableRandomSource.seeded(5),
+        ClientOptions.defaults());
+  }
+
+  // ---------------------------------------------------------------------------------------------
   // The scripted channel
 
   private record Sent(KvRequest request, Duration timeout, long atNanos) {}

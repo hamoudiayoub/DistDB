@@ -4,6 +4,7 @@ import io.distdb.rpc.proto.DeadlineExceeded;
 import io.distdb.rpc.proto.Error;
 import io.distdb.rpc.proto.InvalidArgument;
 import io.distdb.rpc.proto.KvResponse;
+import io.distdb.rpc.proto.NotLeader;
 import io.distdb.rpc.proto.ServerBusy;
 import io.distdb.rpc.proto.StaleRequest;
 import io.distdb.rpc.proto.StorageFailure;
@@ -33,6 +34,23 @@ public final class KvErrors {
     return of(
         Error.newBuilder()
             .setStorageFailure(StorageFailure.newBuilder().setMaybeApplied(maybeApplied)),
+        message);
+  }
+
+  /**
+   * @param leaderId the leader this node knows of, or 0
+   * @param leaderAddress its address, or empty
+   * @param maybeApplied whether this node had already proposed the write
+   */
+  public static KvResponse notLeader(
+      int leaderId, String leaderAddress, boolean maybeApplied, String message) {
+    return of(
+        Error.newBuilder()
+            .setNotLeader(
+                NotLeader.newBuilder()
+                    .setLeaderId(leaderId)
+                    .setLeaderAddress(leaderAddress)
+                    .setMaybeApplied(maybeApplied)),
         message);
   }
 

@@ -13,9 +13,12 @@ public final class Main {
       """
       usage:
         distdb node --data-dir DIR [--listen HOST:PORT]
-            Serve DIR on HOST:PORT (default %1$s) until stopped.
+            Serve DIR on HOST:PORT (default %1$s) until stopped, as a group of one.
 
-        distdb kv [--server HOST:PORT] [--timeout DURATION] OPERATION
+        distdb node --data-dir DIR --id N --peers 1=HOST:PORT,2=HOST:PORT,3=HOST:PORT
+            Run node N of a replicated group; it listens on its own entry in --peers.
+
+        distdb kv [--server HOST:PORT[,HOST:PORT...]] [--timeout DURATION] OPERATION
             get KEY                         print the value (exit 1 if there is none)
             put KEY VALUE                   set KEY to VALUE
             delete KEY                      remove KEY

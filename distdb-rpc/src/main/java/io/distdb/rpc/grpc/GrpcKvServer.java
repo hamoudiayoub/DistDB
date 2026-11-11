@@ -5,6 +5,7 @@ import io.distdb.rpc.KvHandler;
 import io.distdb.rpc.proto.KvGrpc;
 import io.distdb.rpc.proto.KvRequest;
 import io.distdb.rpc.proto.KvResponse;
+import io.grpc.BindableService;
 import io.grpc.Context;
 import io.grpc.Deadline;
 import io.grpc.Server;
@@ -43,16 +44,21 @@ public final class GrpcKvServer implements AutoCloseable {
    * Starts serving on {@code address}. Port 0 picks a free port; {@link #port()} says which.
    *
    * @param clock the clock the handler's deadlines are expressed on
+   * @param others more services on the same port, such as {@link GrpcTransport#service()}
    */
-  public static GrpcKvServer start(InetSocketAddress address, KvHandler handler, Clock clock) {
+  public static GrpcKvServer start(
+      InetSocketAddress address, KvHandler handler, Clock clock, BindableService... others) {
     Objects.requireNonNull(handler);
     Objects.requireNonNull(clock);
     ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
-    Server server =
+    NettyServerBuilder builder =
         NettyServerBuilder.forAddress(address)
             .executor(executor)
-            .addService(new Service(handler, clock))
-            .build();
+            .addService(new Service(handler, clock));
+    for (BindableService s : others) {
+      builder.addService(s);
+    }
+    Server server = builder.build();
     try {
       server.start();
     } catch (IOException e) {

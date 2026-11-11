@@ -2,6 +2,11 @@
 
 > Draft written while building Phase 3. Rewrite it in your own words; the parts to be able to
 > defend without notes are the idempotency rules and "unknown outcome".
+>
+> **Since Phase 5:** `KvService` was replaced by `ReplicatedKv` (a single node is a Raft group of
+> one), and deduplication moved from the request path into `KvStateMachine`, at apply time. The
+> rules below still hold; [0006](0006-replicated-kv.md) explains what replication changed and
+> why.
 
 ## Problem
 
