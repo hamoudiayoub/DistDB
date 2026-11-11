@@ -8,7 +8,7 @@ import java.util.Arrays;
  * private records:
  *
  * <pre>
- *   0x01 ...       local: the node's own records (client sessions now, Raft state from Phase 5)
+ *   0x01 ...       local: the node's own records (client sessions, Raft logs)
  *   0x02 userKey   client data
  * </pre>
  *
@@ -23,6 +23,15 @@ public final class KeySpace {
   static final byte SESSION = 's';
 
   static final byte RESULT = 'r';
+
+  /**
+   * Raft: {@code 'H' group} hard state, {@code 'L' group index} log, {@code 'P' group} snapshot.
+   */
+  static final byte RAFT_HARD_STATE = 'H';
+
+  static final byte RAFT_LOG = 'L';
+
+  static final byte RAFT_SNAPSHOT = 'P';
 
   private KeySpace() {}
 

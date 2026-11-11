@@ -73,3 +73,80 @@ One entry per bug that took more than an hour: symptom, root cause, what it taug
   `build-logic` dependency, applied by a `distdb.protobuf-conventions` plugin), so all modules
   share one classloader.
 - **Lesson:** in a multi-module build, apply plugins from one place.
+
+---
+
+## 2026-11-11 — Leader and follower ping-ponged empty AppendEntries forever
+
+- **Symptom:** 13 of 17 Raft unit tests failed with the test cluster's "messages never stop"
+  guard, right after the first election.
+- **Cause:** after any acknowledgement, the leader called `replicateTo`, which sent an
+  AppendEntries even when it had no new entries. The follower acknowledged that one too, and the
+  leader answered again, forever.
+- **Fix:** an empty AppendEntries has exactly two legitimate uses: probing for the match point,
+  and carrying a new commit index (after a commit, or when a heartbeat answer shows a follower is
+  behind). `replicateTo` now takes `allowEmpty`, and each call site says which case it is.
+- **Lesson:** in a message-driven protocol, "answer every message with a message" loops. Each send
+  needs a reason that eventually runs out. The test harness's message budget turned a hang into a
+  clear failure.
+
+---
+
+## 2026-11-11 — Random simulation missed two real Raft bugs
+
+- **Symptom:** to prove the simulator can catch bugs, I put eight classic Raft mistakes back in,
+  one at a time. Five failed within the first 45 seeds. Two survived 500 seeds each:
+  - committing earlier-term entries by counting replicas (the Figure 8 rule);
+  - a follower committing up to its own last index instead of the last entry the leader just
+    verified.
+- **Cause:** both need scenarios random faults almost never build.
+  - Figure 8 needs about three elections with crashes at exact moments, while a new leader's
+    no-op is still unreplicated.
+  - The stale-suffix case is rare here because the conflict-term hint jumps straight to the
+    divergence point, and a conflict truncates the whole suffix.
+  Fixed knobs (64 entries per message, always 3 voters) made both rarer still.
+- **Fix:** knobs now vary per seed (3 or 5 voters, 1 to 64 entries per message, 1 to 32 in
+  flight, gentle or harsh faults: FoundationDB's "buggify"). Even so, both bugs need targeted
+  unit tests, which now exist and catch them:
+  - `aLeaderCommitsOnlyEntriesOfItsOwnTermByCounting`;
+  - `aFollowerCommitsOnlyWhatTheLeaderHasJustVerified`.
+- **Lesson:** "thousands of seeds pass" only means something once you've checked which bugs the
+  seeds can catch. Mutation testing turns that question into a table. Simulation finds the bugs
+  you didn't think of; targeted tests are for the ones you did.
+
+---
+
+## 2026-11-11 — Persist, then send: shown, not just stated
+
+- **What:** the simulator's host loop was changed (as an experiment) to send a Ready's messages
+  before persisting it. Seed 45 then failed leader completeness. A follower acknowledged entries,
+  its disk failed before writing them, and it came back without them. The leader had already
+  counted it towards a majority, and a later leader was elected without a committed entry.
+- **Lesson:** the Ready ordering rule isn't style. An acknowledgement or a vote is a promise, and
+  a promise must be on disk before anyone hears it.
+
+---
+
+## 2026-11-11 — The simulator's liveness check was wrong, not Raft
+
+- **Symptom:** seed 268 failed liveness: a node "never applied" the entry proposed after the
+  faults stopped, yet its commit index equalled the leader's.
+- **Cause:** that node caught up by installing a snapshot that already included the entry, so it
+  never applied it individually. The check looked for the entry being applied, not for the state
+  machine having reached its index.
+- **Fix:** record the marker's index when any node applies it, and require every member's state
+  machine to have reached that index.
+- **Lesson:** same as the Phase 2 simulator bug. Checkers are code too, and when one fails, ask
+  first which side is wrong.
+
+---
+
+## 2026-11-11 — Builds collided with the IDE's own Gradle build
+
+- **Symptom:** builds failed at random inside `build-logic` ("Unable to delete directory",
+  "is not a directory", "Could not add file ... to ZIP").
+- **Cause:** VS Code's Java extension runs its own Gradle daemon. When files change, it rebuilds
+  the `build-logic` included build at the same moment, in the same `build-logic/build` directory.
+- **Workaround:** a wrapper that retries the build, clearing `build-logic/build` (pure output)
+  when the collision happens. The real fix is to stop the IDE building at the same time, or to
+  give it its own build directory.

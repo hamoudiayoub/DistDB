@@ -7,7 +7,6 @@ import io.distdb.client.KvClient;
 import io.distdb.client.KvException;
 import io.distdb.common.Bytes;
 import io.distdb.env.RandomSource;
-import io.distdb.env.Scheduler;
 import io.distdb.env.SplittableRandomSource;
 import io.distdb.env.sim.SimClock;
 import io.distdb.env.sim.SimFileSystem;
@@ -478,39 +477,6 @@ class KvRetrySimulationTest {
       return Bytes.toHex(request.getRequestId().getClientId().toByteArray())
           + "/"
           + request.getRequestId().getSeq();
-    }
-  }
-
-  /**
-   * One life of the node process on the shared scheduler. When the process dies, the timers it left
-   * behind (background flushes, the session sweeper) must die with it.
-   */
-  private static final class Life implements Scheduler {
-    private final Scheduler shared;
-    private boolean alive = true;
-
-    Life(Scheduler shared) {
-      this.shared = shared;
-    }
-
-    void end() {
-      alive = false;
-    }
-
-    @Override
-    public void execute(Runnable task) {
-      shared.execute(() -> runIfAlive(task));
-    }
-
-    @Override
-    public Cancellable schedule(Duration delay, Runnable task) {
-      return shared.schedule(delay, () -> runIfAlive(task));
-    }
-
-    private void runIfAlive(Runnable task) {
-      if (alive) {
-        task.run();
-      }
     }
   }
 

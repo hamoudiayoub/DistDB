@@ -12,8 +12,9 @@ placeholder name.)
 | 1     | Foundations: build, CI, determinism seams, key encoding      | done    |
 | 2     | LSM storage engine with MVCC keys, crash-tested              | done    |
 | 3     | Single-node KV server over gRPC, CLI client, safe retries    | done    |
-| 4     | Raft library and the simulator                               | next    |
-| 5–10  | Replication, sharding, txns, SQL, hardening                  | planned |
+| 4     | Raft library and the deterministic simulator                 | done    |
+| 5     | Replicated KV service: Raft inside the KV server             | next    |
+| 6–10  | Sharding, txns, SQL, hardening                               | planned |
 
 Phase 2's gate, run at full scale:
 
@@ -27,6 +28,15 @@ with `-Ddistdb.sim.kvSeed=S`:
 
 ```bash
 ./gradlew :distdb-server:test :distdb-sim:test -Ddistdb.sim.kvSeeds=2000
+```
+
+Phase 4's gate is `RaftSimulationTest`. Each seed runs a whole Raft group in one thread over a
+lossy, partitioned network, with power cuts, failing disks and membership changes, and checks the
+four safety properties, linearizable reads, and recovery once the faults stop. CI runs 100 seeds;
+the gate is 5,000. `-Ddistdb.sim.raftSeed=S` replays one seed exactly:
+
+```bash
+./gradlew :distdb-sim:test --tests '*RaftSimulationTest' -Ddistdb.sim.raftSeeds=5000
 ```
 
 ## Try it
@@ -71,16 +81,16 @@ files in the core modules.
 distdb-common   byte-comparable key encoding, ids
 distdb-env      Clock, RandomSource, Transport, FileSystem, Scheduler + real implementations
 distdb-storage  LSM engine                                  (Phase 2)
-distdb-raft     Raft as a pure state machine                (Phase 4)
+distdb-raft     Raft as a pure state machine, no I/O        (Phase 4)
 distdb-rpc      kv.proto, KvChannel/KvHandler, gRPC         (Phase 3)
-distdb-kv       KvService: dedup, limits; replicas later    (Phases 3, 5)
+distdb-kv       KvService, RaftStore; replicas next         (Phases 3-5)
 distdb-pd       placement driver and TSO                    (Phase 6)
 distdb-client   KvClient: deadlines, retries; routing later (Phases 3, 6)
 distdb-txn      Percolator transactions                     (Phase 7)
 distdb-sql      parser, planner, executor                   (Phases 8-9)
 distdb-pgwire   PostgreSQL wire protocol                    (Phase 8)
 distdb-server   the distdb binary: node, kv                 (Phases 3, 10)
-distdb-sim      simulations, architecture tests
+distdb-sim      SimNetwork, RaftSimulation, safety checkers (Phases 3-4)
 distdb-bench    benchmarks                                  (Phase 10)
 docs/design/    one design note per component
 docs/journal.md learning journal
