@@ -13,14 +13,71 @@ public final class PlanPrinter {
   private PlanPrinter() {}
 
   public static List<String> render(Plan p) {
+    return render(p, null, null);
+  }
+
+  /**
+   * The plan with what each operator did ({@code ops}: rows and time; {@code remote}: a remote
+   * scan's requests, nodes and bytes), as EXPLAIN ANALYZE shows it.
+   */
+  public static List<String> render(
+      Plan p,
+      java.util.Map<Plan, io.distdb.sql.exec.ExecContext.OpStats> ops,
+      java.util.Map<Plan, io.distdb.sql.exec.ExecContext.RemoteStats> remote) {
     List<String> out = new ArrayList<>();
-    render(p, 0, out);
+    render(p, 0, out, ops, remote);
     return out;
   }
 
-  private static void render(Plan p, int depth, List<String> out) {
+  private static String actual(
+      Plan p,
+      java.util.Map<Plan, io.distdb.sql.exec.ExecContext.OpStats> ops,
+      java.util.Map<Plan, io.distdb.sql.exec.ExecContext.RemoteStats> remote) {
+    if (ops == null) {
+      return "";
+    }
+    io.distdb.sql.exec.ExecContext.OpStats s = ops.get(p);
+    StringBuilder b = new StringBuilder("  (");
+    if (s == null) {
+      b.append("never ran");
+    } else {
+      b.append("rows=")
+          .append(s.rows)
+          .append(String.format(java.util.Locale.ROOT, " time=%.3f ms", s.nanos / 1e6));
+      if (s.opens > 1) {
+        b.append(" loops=").append(s.opens);
+      }
+    }
+    io.distdb.sql.exec.ExecContext.RemoteStats r = remote == null ? null : remote.get(p);
+    if (r != null) {
+      if (r.local) {
+        b.append(" ran on the gateway (own writes in the span)");
+      } else {
+        b.append(" requests=")
+            .append(r.requests)
+            .append(" nodes=")
+            .append(r.nodes)
+            .append(" read on ranges=")
+            .append(r.rowsScanned)
+            .append(" rows")
+            .append(" received=")
+            .append(r.rowsReturned)
+            .append(" rows, ")
+            .append(r.bytes)
+            .append(" bytes");
+      }
+    }
+    return b.append(")").toString();
+  }
+
+  private static void render(
+      Plan p,
+      int depth,
+      List<String> out,
+      java.util.Map<Plan, io.distdb.sql.exec.ExecContext.OpStats> ops,
+      java.util.Map<Plan, io.distdb.sql.exec.ExecContext.RemoteStats> remote) {
     String pad = "  ".repeat(depth);
-    out.add(pad + (depth == 0 ? "" : "-> ") + describe(p));
+    out.add(pad + (depth == 0 ? "" : "-> ") + describe(p) + actual(p, ops, remote));
     for (Scalar s : Plans.scalars(p)) {
       Scalars.visit(
           s,
@@ -33,12 +90,12 @@ public final class PlanPrinter {
                       + "subquery ("
                       + q.kind().name().toLowerCase(java.util.Locale.ROOT)
                       + "):");
-              render(q.plan(), depth + 2, out);
+              render(q.plan(), depth + 2, out, ops, remote);
             }
           });
     }
     for (Plan c : Plans.children(p)) {
-      render(c, depth + 1, out);
+      render(c, depth + 1, out, ops, remote);
     }
   }
 
@@ -71,6 +128,54 @@ public final class PlanPrinter {
         }
         yield b.toString();
       }
+      case Plan.RemoteScan s -> {
+        StringBuilder b = new StringBuilder("remote scan " + name(s.table(), s.alias()));
+        if (!s.prefix().isEmpty() || s.low() != null || s.high() != null) {
+          b.append(" on ").append(s.table().primary().name());
+        }
+        if (!s.prefix().isEmpty()) {
+          b.append(" = (").append(exprs(s.prefix(), s.columns())).append(")");
+        }
+        if (s.low() != null) {
+          b.append(s.low().inclusive() ? " from " : " after ")
+              .append(expr(s.low().value(), s.columns()));
+        }
+        if (s.high() != null) {
+          b.append(s.high().inclusive() ? " through " : " before ")
+              .append(expr(s.high().value(), s.columns()));
+        }
+        if (s.filter() != null) {
+          b.append(" filter ").append(expr(s.filter(), tableCols(s.table())));
+        }
+        if (s.aggregating()) {
+          StringJoiner aggs = new StringJoiner(", ");
+          for (Scalar.AggCall c : s.aggs()) {
+            aggs.add(
+                c.function()
+                    + "("
+                    + (c.arg() == null ? "*" : expr(c.arg(), tableCols(s.table())))
+                    + ")");
+          }
+          b.append(" partial aggregate")
+              .append(s.groups().isEmpty() ? "" : " by " + exprs(s.groups(), tableCols(s.table())))
+              .append(s.aggs().isEmpty() ? "" : ": " + aggs);
+        } else {
+          int kept = 0;
+          for (boolean k : s.keep()) {
+            kept += k ? 1 : 0;
+          }
+          if (kept < s.keep().length) {
+            b.append(" columns ").append(kept).append("/").append(s.keep().length);
+          }
+        }
+        if (s.limit() >= 0) {
+          b.append(" limit ").append(s.limit()).append(" per range");
+        }
+        yield b.toString();
+      }
+      case Plan.MergeAggregate m ->
+          "merge aggregate"
+              + (m.groupCount() == 0 ? "" : " (" + m.groupCount() + " group columns)");
       case Plan.Join j -> j.kind().name().toLowerCase(java.util.Locale.ROOT) + " join";
       case Plan.NestedLoopJoin j ->
           "nested loop " + kind(j.kind()) + "join on " + expr(j.on(), j.columns());
@@ -138,6 +243,14 @@ public final class PlanPrinter {
     return k == io.distdb.sql.parse.Ast.JoinKind.INNER
         ? ""
         : k.name().toLowerCase(java.util.Locale.ROOT) + " ";
+  }
+
+  private static List<Col> tableCols(TableDesc t) {
+    List<Col> cols = new ArrayList<>();
+    for (TableDesc.Column c : t.columns()) {
+      cols.add(new Col(null, c.name(), c.type().type()));
+    }
+    return cols;
   }
 
   private static String name(TableDesc t, String alias) {

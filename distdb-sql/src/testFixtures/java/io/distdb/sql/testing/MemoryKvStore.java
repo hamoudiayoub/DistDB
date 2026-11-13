@@ -172,6 +172,36 @@ public final class MemoryKvStore implements KvStore {
     }
 
     @Override
+    public boolean hasWritesIn(byte[] startKey, byte[] end) {
+      byte[] k = writes.ceilingKey(startKey);
+      return k != null && (end == null || Bytes.compare(k, end) < 0);
+    }
+
+    /** One "range": the whole store, through the same coprocessor a cluster's ranges run. */
+    @Override
+    public List<CopResult> coprocessor(byte[] startKey, byte[] end, byte[] program) {
+      io.distdb.rpc.Coprocessor.Run run = new io.distdb.sql.exec.SqlCoprocessor().start(program);
+      long rows = 0;
+      long bytes = 0;
+      for (Entry e : readRange(startKey, end, start)) {
+        rows++;
+        bytes += e.key().length + e.value().length;
+        if (!run.accept(e.key(), e.value())) {
+          if (run.satisfied()) {
+            return List.of(new CopResult(run.finish(), rows, bytes, 0));
+          }
+          // Stopped early (a limit or the row budget): return what it has, and run again from the
+          // next key, as a range would resume.
+          List<CopResult> out = new ArrayList<>();
+          out.add(new CopResult(run.finish(), rows, bytes, 0));
+          out.addAll(coprocessor(Bytes.successor(e.key()), end, program));
+          return out;
+        }
+      }
+      return List.of(new CopResult(run.finish(), rows, bytes, 0));
+    }
+
+    @Override
     public void put(byte[] key, byte[] value) {
       writes.put(key.clone(), value.clone());
     }

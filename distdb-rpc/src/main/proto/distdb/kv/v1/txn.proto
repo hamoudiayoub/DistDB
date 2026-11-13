@@ -166,3 +166,27 @@ message TxnCommitted {
 message TxnTooOld {
   uint64 floor = 1;
 }
+
+// A program (a SQL fragment) run over one span at a snapshot, on the range that holds it: the
+// range applies Percolator's visibility and lock rules, feeds the visible entries to the program,
+// and answers its result. The client clips the span at each range's end and continues from the
+// resume key, as for scans.
+message CoprocessorRequest {
+  bytes start_key = 1;
+  optional bytes end_key = 2;
+  uint64 read_ts = 3;
+  bytes program = 4;
+}
+
+message CoprocessorResponse {
+  // The program's result for the part of the span it covered.
+  bytes result = 1;
+  // Where the next request starts, when the program (or the range's end) stopped it early.
+  optional bytes resume_key = 2;
+  uint64 rows_scanned = 3;
+  uint64 bytes_scanned = 4;
+  // The node that served it.
+  uint32 served_by = 5;
+  // The program needs nothing more from this span (a limit reached): do not resume.
+  bool satisfied = 6;
+}

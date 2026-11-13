@@ -96,6 +96,8 @@ final class ShardedCommands {
             failure -> halt(err, failure),
             null);
     holder.set(store);
+    // Ranges run the SQL layer's pushed-down fragments: filters, projections, partial aggregates.
+    store.coprocessor(new io.distdb.sql.exec.SqlCoprocessor());
     GrpcKvServer server =
         GrpcKvServer.start(
             new InetSocketAddress(listen.host(), listen.port()),

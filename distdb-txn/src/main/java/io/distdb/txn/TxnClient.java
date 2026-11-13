@@ -14,6 +14,7 @@ import io.distdb.rpc.proto.LockInfo;
 import io.distdb.rpc.proto.TxnCommitRequest;
 import io.distdb.rpc.proto.TxnRollbackRequest;
 import java.time.Duration;
+import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
@@ -179,6 +180,20 @@ public final class TxnClient {
 
   // -----------------------------------------------------------------------------------------------
   // For Txn
+
+  KvClient kv() {
+    return kv;
+  }
+
+  /** The range boundaries inside {@code [start, end)} the client knows. */
+  public List<byte[]> rangeSplits(byte[] start, byte[] end) {
+    return kv.cachedSplits(start, end);
+  }
+
+  /** What this client has sent and received over the network (its KV client's traffic). */
+  public KvClient.Traffic traffic() {
+    return kv.traffic();
+  }
 
   CompletableFuture<KvResponse> send(KvRequest request) {
     return kv.send(request, options.timeout());

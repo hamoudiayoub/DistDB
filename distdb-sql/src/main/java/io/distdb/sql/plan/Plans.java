@@ -34,6 +34,8 @@ public final class Plans {
       case FullScan s -> List.of();
       case PointGet g -> List.of();
       case IndexScan s -> List.of();
+      case Plan.RemoteScan s -> List.of();
+      case Plan.MergeAggregate m -> List.of(m.input());
       case OneRow o -> List.of();
       case Values v -> List.of();
       case Join j -> List.of(j.left(), j.right());
@@ -65,6 +67,20 @@ public final class Plans {
         }
       }
       case Values v -> v.rows().forEach(out::addAll);
+      case Plan.RemoteScan s -> {
+        out.addAll(s.prefix());
+        if (s.low() != null) {
+          out.add(s.low().value());
+        }
+        if (s.high() != null) {
+          out.add(s.high().value());
+        }
+        if (s.filter() != null) {
+          out.add(s.filter());
+        }
+        out.addAll(s.groups());
+        out.addAll(s.aggs());
+      }
       case Join j -> out.add(j.on());
       case NestedLoopJoin j -> out.add(j.on());
       case HashJoin j -> {

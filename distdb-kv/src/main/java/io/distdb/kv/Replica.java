@@ -33,6 +33,7 @@ final class Replica {
   final RaftStore raftStore;
   final RangeStateMachine machine;
   final RaftNode raft;
+
   private final Store store;
 
   private final Map<KvStateMachine.RequestKey, List<CompletableFuture<KvResponse>>> writes =
@@ -277,6 +278,14 @@ final class Replica {
                 p.request.getTxnScan(),
                 machine.limits(),
                 store.config().kv().maxScanLimit()));
+      } else if (p.request.hasCoprocessor()) {
+        p.future.complete(
+            Percolator.coprocessor(
+                store.engine(),
+                p.request.getCoprocessor(),
+                machine.limits(),
+                store.coprocessor(),
+                store.config().self().value()));
       } else if (p.request.hasScanLocks()) {
         p.future.complete(Percolator.scanLocks(store.engine(), p.request.getScanLocks(), d));
       } else {

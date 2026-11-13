@@ -52,6 +52,33 @@ class SqlLogicSimulationTest {
             + " queries, all as PostgreSQL answered");
   }
 
+  /**
+   * The same files where every table soon spans many ranges, split while the statements run: the
+   * fragments fan out, partial aggregates merge across ranges, and stale range caches make requests
+   * clip at a range's end and resume in the next.
+   */
+  @Test
+  void everyFileMatchesPostgresOnManySplittingRanges() {
+    int queries = 0;
+    int ranges = 0;
+    for (String file : SqlLogic.FILES) {
+      ShardedKvSimulation.Cluster cluster =
+          ShardedKvSimulation.Cluster.start(
+              file.hashCode() + 1L, 4, 32, ShardedKvSimulation.Wire.NONE);
+      queries +=
+          SqlLogic.run(file, SqlLogic.load(file), SqlLogic.of(gateway(cluster).session()))
+              .queries();
+      ranges = Math.max(ranges, cluster.rangeCount());
+    }
+    assertThat(ranges).as("ranges in the busiest file").isGreaterThan(20);
+    System.out.println(
+        "sqllogictest on splitting ranges: "
+            + queries
+            + " queries, all as PostgreSQL answered, up to "
+            + ranges
+            + " ranges");
+  }
+
   @Test
   void everyGatewaySeesEveryTable() {
     ShardedKvSimulation.Cluster cluster = ShardedKvSimulation.Cluster.start(42);

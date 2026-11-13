@@ -7,7 +7,7 @@ import io.distdb.sql.catalog.TableDesc.Index;
 import io.distdb.sql.encoding.RowCodec;
 import io.distdb.sql.kv.KvTxn;
 import io.distdb.sql.plan.Bound;
-import io.distdb.sql.plan.Planner;
+import io.distdb.sql.plan.Plan;
 import io.distdb.sql.plan.Scalar;
 import io.distdb.sql.types.Values;
 import java.util.ArrayList;
@@ -28,9 +28,9 @@ public final class Writes {
   /** The rows changed, and the RETURNING rows (empty without RETURNING). */
   public record Outcome(long count, List<Object[]> returning) {}
 
-  public static Outcome insert(Bound.Insert b, ExecContext ctx) {
+  public static Outcome insert(Bound.Insert b, Plan plan, ExecContext ctx) {
     TableDesc t = b.table();
-    List<Object[]> source = Operators.drain(Operators.build(Planner.plan(b.source()), ctx));
+    List<Object[]> source = Operators.drain(Operators.build(plan, ctx));
     long[] rowids = t.hasRowid() ? ctx.store.timestamps(source.size()) : null;
     int rowidPosition = t.hasRowid() ? t.positions(t.primary())[0] : -1;
     boolean[] targeted = new boolean[t.columns().size()];
@@ -100,9 +100,9 @@ public final class Writes {
     return true;
   }
 
-  public static Outcome update(Bound.Update b, ExecContext ctx) {
+  public static Outcome update(Bound.Update b, Plan source, ExecContext ctx) {
     TableDesc t = b.table();
-    List<Object[]> rows = Operators.drain(Operators.build(Planner.plan(b.source()), ctx));
+    List<Object[]> rows = Operators.drain(Operators.build(source, ctx));
     List<Object[]> returning = new ArrayList<>();
     for (Object[] old : rows) {
       Object[] row = old.clone();
@@ -144,9 +144,9 @@ public final class Writes {
     return new Outcome(rows.size(), returning);
   }
 
-  public static Outcome delete(Bound.Delete b, ExecContext ctx) {
+  public static Outcome delete(Bound.Delete b, Plan source, ExecContext ctx) {
     TableDesc t = b.table();
-    List<Object[]> rows = Operators.drain(Operators.build(Planner.plan(b.source()), ctx));
+    List<Object[]> rows = Operators.drain(Operators.build(source, ctx));
     List<Object[]> returning = new ArrayList<>();
     for (Object[] row : rows) {
       deleteRow(ctx.txn, t, row);

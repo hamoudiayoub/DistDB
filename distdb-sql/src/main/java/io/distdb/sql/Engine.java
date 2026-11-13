@@ -13,9 +13,20 @@ public final class Engine {
 
   private final KvStore store;
   private final Catalog catalog = new Catalog();
+  private final io.distdb.env.Clock clock;
 
   public Engine(KvStore store) {
+    this(store, io.distdb.env.SystemClock.INSTANCE);
+  }
+
+  /** {@code clock} times EXPLAIN ANALYZE (the simulated clock, in a simulation). */
+  public Engine(KvStore store, io.distdb.env.Clock clock) {
     this.store = Objects.requireNonNull(store);
+    this.clock = Objects.requireNonNull(clock);
+  }
+
+  io.distdb.env.Clock clock() {
+    return clock;
   }
 
   /** A new session (a client connection's state). Sessions are not thread-safe; the engine is. */

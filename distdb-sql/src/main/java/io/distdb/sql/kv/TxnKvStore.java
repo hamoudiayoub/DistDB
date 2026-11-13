@@ -51,6 +51,11 @@ public final class TxnKvStore implements KvStore {
     await(client.fence(ts));
   }
 
+  @Override
+  public int rangeCount(byte[] start, byte[] end) {
+    return client.rangeSplits(start, end).size() + 1;
+  }
+
   private <T> T await(CompletableFuture<T> f) {
     try {
       return awaiter.await(f);
@@ -140,6 +145,31 @@ public final class TxnKvStore implements KvStore {
       List<Entry> out = new ArrayList<>(entries.size());
       for (Txn.Entry e : entries) {
         out.add(new Entry(e.key(), e.value()));
+      }
+      return out;
+    }
+
+    @Override
+    public boolean hasWritesIn(byte[] start, byte[] end) {
+      return txn.hasWritesIn(start, end);
+    }
+
+    @Override
+    public List<CopResult> coprocessor(byte[] start, byte[] end, byte[] program) {
+      List<io.distdb.rpc.proto.CoprocessorResponse> responses;
+      try {
+        responses = await(txn.coprocessor(start, end, program));
+      } catch (SqlException e) {
+        throw where(e, "coprocessor from " + KeyReader.toDebugString(start));
+      }
+      List<CopResult> out = new ArrayList<>(responses.size());
+      for (io.distdb.rpc.proto.CoprocessorResponse r : responses) {
+        out.add(
+            new CopResult(
+                r.getResult().toByteArray(),
+                r.getRowsScanned(),
+                r.getBytesScanned(),
+                r.getServedBy()));
       }
       return out;
     }

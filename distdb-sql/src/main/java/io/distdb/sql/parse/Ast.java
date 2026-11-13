@@ -30,7 +30,8 @@ public final class Ast {
           Rollback,
           SetVar,
           ShowVar,
-          Explain {}
+          Explain,
+          Analyze {}
 
   public record QueryStatement(Query query) implements Statement {}
 
@@ -92,7 +93,14 @@ public final class Ast {
 
   public record ShowVar(String name) implements Statement {}
 
-  public record Explain(Statement statement) implements Statement {}
+  /**
+   * {@code EXPLAIN [ANALYZE] statement}: the plan, or (ANALYZE) the plan run, with what each
+   * operator did.
+   */
+  public record Explain(Statement statement, boolean analyze) implements Statement {}
+
+  /** {@code ANALYZE [table]}: collect the statistics the optimizer estimates with. */
+  public record Analyze(String table) implements Statement {}
 
   // -----------------------------------------------------------------------------------------------
   // Queries

@@ -95,11 +95,15 @@ class SqlClusterTest {
                     "SELECT d.name, count(*) FROM person p JOIN dept d ON p.dept = d.id"
                         + " GROUP BY d.name ORDER BY 1"))
             .containsExactly("eng 2", "sales 1");
-        // An index built through one node is used through another.
-        exec(c, "CREATE INDEX person_name ON person (name)");
+        // An index built through one node is used, and maintained, through another. (Unique: on
+        // four rows a non-unique index loses to one filtered scan on the table's range, by cost.)
+        exec(c, "CREATE UNIQUE INDEX person_name ON person (name)");
         assertThat(String.join("\n", query(a, "EXPLAIN SELECT id FROM person WHERE name = 'cy'")))
             .contains("index scan person on person_name");
         assertThat(query(a, "SELECT id FROM person WHERE name = 'cy'")).containsExactly("12");
+        assertThatThrownBy(() -> exec(a, "INSERT INTO person VALUES (14, 'cy', 1)"))
+            .isInstanceOfSatisfying(
+                SQLException.class, e -> assertThat(e.getSQLState()).isEqualTo("23505"));
         // A transaction across nodes' sessions: a conflict, then the retry.
         a.setAutoCommit(false);
         b.setAutoCommit(false);

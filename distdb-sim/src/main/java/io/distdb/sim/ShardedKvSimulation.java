@@ -153,6 +153,20 @@ public final class ShardedKvSimulation {
     }
   }
 
+  /**
+   * What the clients' links cost beyond latency, for measurements (the Phase 9 gate). Off ({@link
+   * #NONE}) everywhere else, so every other run's seeds replay unchanged.
+   *
+   * @param bytesPerSecond each node's inbound link carries this many bytes a second, one message at
+   *     a time (0: unlimited)
+   * @param perKeyRead what a range spends reading one key for a scan or a coprocessor
+   * @param lossless whether the clients' links and the replicas' network lose nothing (a healthy
+   *     network: the run measures speed, and the faulty runs check correctness)
+   */
+  public record Wire(long bytesPerSecond, Duration perKeyRead, boolean lossless) {
+    public static final Wire NONE = new Wire(0, Duration.ZERO, false);
+  }
+
   /** What happened, so tests can check the faults and the reshuffling were real. */
   public record Report(
       long seed,
@@ -180,6 +194,10 @@ public final class ShardedKvSimulation {
       new EngineOptions(64 * 1024, 4096, 10, 256 * 1024, 4, 12, 1024 * 1024, 10);
   private static final Comparator<NodeId> BY_VALUE = Comparator.comparingInt(NodeId::value);
 
+  /** What ranges run for pushed-down SQL fragments; stateless, so every store shares it. */
+  private static final io.distdb.rpc.Coprocessor COPROCESSOR =
+      new io.distdb.sql.exec.SqlCoprocessor();
+
   private final long seed;
   private final Options options;
   private final RandomSource random;
@@ -205,6 +223,11 @@ public final class ShardedKvSimulation {
   private final Map<String, String> committedAt = new HashMap<>();
   private final Map<Long, ArrayDeque<String>> rangeTrace = new HashMap<>();
   private boolean faulty = true;
+  private final Wire wire;
+
+  /** When each node's inbound link is free again (nanos), under a {@link Wire} bandwidth. */
+  private final Map<NodeId, Long> inboundBusy = new HashMap<>();
+
   private boolean finished;
   private Throwable violation;
   private long quietStart;
@@ -226,10 +249,22 @@ public final class ShardedKvSimulation {
   private long gcRounds;
 
   private ShardedKvSimulation(long seed, Options options) {
+    this(seed, options, Wire.NONE);
+  }
+
+  private ShardedKvSimulation(long seed, Options options, Wire wire) {
     this.seed = seed;
     this.options = Objects.requireNonNull(options);
+    this.wire = Objects.requireNonNull(wire);
     this.random = SplittableRandomSource.seeded(seed);
-    this.net = new SimNetwork(scheduler, random.split(), SimNetwork.Faults.defaults());
+    this.net =
+        new SimNetwork(
+            scheduler,
+            random.split(),
+            wire.lossless()
+                ? new SimNetwork.Faults(
+                    0, 0, Duration.ofMillis(1), Duration.ofMillis(5), 0, Duration.ZERO)
+                : SimNetwork.Faults.defaults());
     for (int i = 1; i <= 3; i++) {
       pdPeers.put(new NodeId(200 + i), "pd" + i);
     }
@@ -269,22 +304,23 @@ public final class ShardedKvSimulation {
     private final ShardedKvSimulation sim;
     private int clients;
 
-    private Cluster(long seed) {
+    private Cluster(long seed, int dataNodes, long splitKeys, Wire wire) {
       sim =
           new ShardedKvSimulation(
               seed,
               new Options(
-                  3,
+                  dataNodes,
                   0,
                   1,
-                  1_000_000,
+                  splitKeys,
                   false,
                   Duration.ZERO,
                   Duration.ofSeconds(1),
                   1000,
                   Duration.ofMillis(200),
                   true,
-                  Duration.ofHours(1)));
+                  Duration.ofHours(1)),
+              wire);
       sim.faulty = false;
       sim.pds.values().forEach(PdNode::boot);
       sim.data.values().forEach(DataNode::boot);
@@ -292,7 +328,40 @@ public final class ShardedKvSimulation {
     }
 
     public static Cluster start(long seed) {
-      return new Cluster(seed);
+      return new Cluster(seed, 3, 1_000_000, Wire.NONE);
+    }
+
+    /**
+     * A cluster for measurements: {@code dataNodes} data nodes, ranges split above {@code
+     * splitKeys} keys (a row is two: its value and its commit record) and spread by the PD, and
+     * client links that cost what {@code wire} says.
+     */
+    public static Cluster start(long seed, int dataNodes, long splitKeys, Wire wire) {
+      return new Cluster(seed, dataNodes, splitKeys, wire);
+    }
+
+    /** The simulated clock, for an engine's EXPLAIN ANALYZE. */
+    public io.distdb.env.Clock clock() {
+      return sim.clock;
+    }
+
+    /** How many ranges the PD knows (0 without a PD leader). */
+    public int rangeCount() {
+      PdNode p = sim.pdLeader();
+      return p == null ? 0 : p.pd.ranges().size();
+    }
+
+    /** How many distinct data nodes lead at least one range. */
+    public int leaderNodes() {
+      PdNode p = sim.pdLeader();
+      if (p == null) {
+        return 0;
+      }
+      Set<Integer> leaders = new HashSet<>();
+      for (RangeInfo r : p.pd.ranges()) {
+        leaders.add(r.getLeader());
+      }
+      return leaders.size();
     }
 
     /** A new client, on its own endpoint; {@code crash} decides where its transactions stop. */
@@ -335,10 +404,15 @@ public final class ShardedKvSimulation {
           ClientOptions.defaults());
     }
 
-    /** Runs the simulation until {@code f} completes (at most a minute), and returns its value. */
+    /**
+     * Runs the simulation until {@code f} completes (at most a simulated minute), and returns its
+     * value. It stops at the task that completes {@code f}, so the clock then reads the moment it
+     * did: latencies measured across awaits are exact.
+     */
     public <T> T await(CompletableFuture<T> f) {
-      for (int i = 0; i < 6000 && !f.isDone(); i++) {
-        sim.scheduler.runFor(Duration.ofMillis(10));
+      long deadline = sim.clock.nanoTime() + Duration.ofMinutes(1).toNanos();
+      while (!f.isDone() && sim.clock.nanoTime() < deadline && sim.scheduler.runNext()) {
+        // one task at a time
       }
       if (!f.isDone()) {
         throw new AssertionError("not done after a simulated minute");
@@ -1200,6 +1274,8 @@ public final class ShardedKvSimulation {
       }
       up = true;
       armed = false;
+      // Ranges run the SQL layer's pushed-down fragments (Phase 9).
+      store.coprocessor(COPROCESSOR);
       store.start();
     }
 
@@ -1894,7 +1970,7 @@ public final class ShardedKvSimulation {
         return reply;
       }
       scheduler.schedule(
-          delay(),
+          transit(server.id(), Duration.ZERO, request),
           () -> {
             if (!server.isUp() || !net.connected(from, server.id())) {
               return;
@@ -1904,7 +1980,8 @@ public final class ShardedKvSimulation {
                 .handle(request, deadline)
                 .whenComplete((response, error) -> {
                   if (response != null && link(server.id(), from)) {
-                    scheduler.schedule(delay(), () -> reply.complete(response));
+                    scheduler.schedule(
+                        transit(from, reading(response), response), () -> reply.complete(response));
                   }
                 });
           });
@@ -1912,11 +1989,48 @@ public final class ShardedKvSimulation {
     }
 
     private boolean link(NodeId a, NodeId b) {
+      if (wire.lossless()) {
+        return net.connected(a, b);
+      }
       return net.connected(a, b) && random.nextInt(100) >= 2;
     }
 
     private Duration delay() {
       return Duration.ofMillis(random.nextInt(1, 6));
+    }
+
+    /**
+     * How long until {@code message}, sent once {@code work} is done, has fully reached {@code to}:
+     * the latency, then, under a {@link Wire} bandwidth, its bytes on {@code to}'s inbound link
+     * after whatever that link is still carrying.
+     */
+    private Duration transit(NodeId to, Duration work, com.google.protobuf.MessageLite message) {
+      Duration latency = delay();
+      if (wire.bytesPerSecond() == 0) {
+        return work.plus(latency);
+      }
+      long now = clock.nanoTime();
+      long start =
+          Math.max(now + work.toNanos() + latency.toNanos(), inboundBusy.getOrDefault(to, 0L));
+      long done = start + message.getSerializedSize() * 1_000_000_000L / wire.bytesPerSecond();
+      inboundBusy.put(to, done);
+      return Duration.ofNanos(done - now);
+    }
+
+    /** What the range spent reading keys for {@code response}, under a {@link Wire}. */
+    private Duration reading(KvResponse response) {
+      if (wire.perKeyRead().isZero()) {
+        return Duration.ZERO;
+      }
+      long keys =
+          switch (response.getResultCase()) {
+            case TXN_SCAN -> response.getTxnScan().getEntriesCount();
+            case SCAN -> response.getScan().getEntriesCount();
+            case COPROCESSOR -> response.getCoprocessor().getRowsScanned();
+            case TXN_GET, GET -> 1;
+            default -> 0;
+          };
+      return wire.perKeyRead().multipliedBy(keys);
     }
 
     @Override

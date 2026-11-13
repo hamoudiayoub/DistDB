@@ -32,6 +32,58 @@ public final class Operators {
   private Operators() {}
 
   public static Operator build(Plan p, ExecContext ctx) {
+    Operator op = operator(p, ctx);
+    if (ctx.opStats() == null) {
+      return op;
+    }
+    return new Timed(
+        op, ctx.opStats().computeIfAbsent(p, x -> new ExecContext.OpStats()), ctx.clock());
+  }
+
+  /** For EXPLAIN ANALYZE: counts an operator's rows and the time spent in it (and below it). */
+  private static final class Timed implements Operator {
+    private final Operator inner;
+    private final ExecContext.OpStats stats;
+    private final io.distdb.env.Clock clock;
+
+    Timed(Operator inner, ExecContext.OpStats stats, io.distdb.env.Clock clock) {
+      this.inner = inner;
+      this.stats = stats;
+      this.clock = clock;
+    }
+
+    @Override
+    public void open() {
+      long t = clock.nanoTime();
+      stats.opens++;
+      try {
+        inner.open();
+      } finally {
+        stats.nanos += clock.nanoTime() - t;
+      }
+    }
+
+    @Override
+    public Object[] next() {
+      long t = clock.nanoTime();
+      try {
+        Object[] r = inner.next();
+        if (r != null) {
+          stats.rows++;
+        }
+        return r;
+      } finally {
+        stats.nanos += clock.nanoTime() - t;
+      }
+    }
+
+    @Override
+    public void close() {
+      inner.close();
+    }
+  }
+
+  private static Operator operator(Plan p, ExecContext ctx) {
     return switch (p) {
       case Plan.FullScan s ->
           new SpanScan(ctx, s.table(), s.table().primary(), () -> fullSpan(s.table()));
@@ -70,6 +122,8 @@ public final class Operators {
       case Plan.SetOp s ->
           new SetOp(s.kind(), s.all(), build(s.left(), ctx), build(s.right(), ctx));
       case Plan.OneRow o -> new ValuesOp(ctx, List.of(List.of()));
+      case Plan.RemoteScan r -> new RemoteScan(ctx, r);
+      case Plan.MergeAggregate m -> new MergeAggregate(build(m.input(), ctx), m);
       case Plan.Scan s -> throw new IllegalStateException("a logical scan was not planned");
       case Plan.Join j -> throw new IllegalStateException("a logical join was not planned");
     };
@@ -261,6 +315,135 @@ public final class Operators {
       return null;
     }
     return RowCodec.decodeRow(t, pk, value.get());
+  }
+
+  /**
+   * A fragment run on the ranges (in parallel, through the transaction), or, when the transaction
+   * has its own writes in the span (which the ranges cannot see), the same fragment run here over
+   * the transaction's own view of the rows.
+   */
+  private static final class RemoteScan implements Operator {
+    private final ExecContext ctx;
+    private final Plan.RemoteScan plan;
+    private java.util.Iterator<Object[]> out;
+
+    RemoteScan(ExecContext ctx, Plan.RemoteScan plan) {
+      this.ctx = ctx;
+      this.plan = plan;
+    }
+
+    @Override
+    public void open() {
+      Plan.IndexScan asScan =
+          new Plan.IndexScan(
+              plan.table(),
+              plan.table().primary(),
+              plan.alias(),
+              plan.prefix(),
+              plan.low(),
+              plan.high(),
+              plan.columns());
+      Span s = span(asScan, ctx);
+      List<Scalar> groups = new ArrayList<>();
+      for (Scalar g : plan.groups()) {
+        groups.add(FragmentCodec.bind(g, ctx));
+      }
+      List<Scalar.AggCall> aggs = new ArrayList<>();
+      for (Scalar.AggCall a : plan.aggs()) {
+        aggs.add(
+            new Scalar.AggCall(a.function(), FragmentCodec.bind(a.arg(), ctx), false, a.type()));
+      }
+      Fragment f =
+          new Fragment(
+              plan.table(),
+              FragmentCodec.bind(plan.filter(), ctx),
+              plan.keep(),
+              groups,
+              aggs,
+              plan.limit());
+      List<Object[]> rows = new ArrayList<>();
+      ExecContext.RemoteStats stats = ctx.remoteStats(plan);
+      if (s.empty() || Arrays.compareUnsigned(s.start(), s.end()) >= 0) {
+        if (f.aggregating()) {
+          rows.addAll(new Fragment.Run(f).rows());
+        }
+      } else if (ctx.txn.hasWritesIn(s.start(), s.end())) {
+        rows.addAll(local(f, s));
+        stats.local = true;
+      } else {
+        for (KvTxn.CopResult r : ctx.txn.coprocessor(s.start(), s.end(), f.encode())) {
+          rows.addAll(f.decodeResult(r.result()));
+          stats.requests++;
+          stats.bytes += r.result().length;
+          stats.rowsScanned += r.rowsScanned();
+          stats.nodes.add(r.servedBy());
+        }
+      }
+      stats.rowsReturned += rows.size();
+      out = rows.iterator();
+    }
+
+    /** The fragment over this transaction's view of the span (its own writes included). */
+    private List<Object[]> local(Fragment f, Span s) {
+      List<Object[]> rows = new ArrayList<>();
+      Fragment.Run run = new Fragment.Run(f);
+      byte[] resume = s.start();
+      while (true) {
+        List<KvTxn.Entry> page = ctx.txn.scan(resume, s.end(), PAGE);
+        for (KvTxn.Entry e : page) {
+          if (!run.accept(e.key(), e.value())) {
+            if (run.satisfied()) {
+              rows.addAll(run.rows());
+              return rows;
+            }
+            rows.addAll(run.rows()); // the row budget: a fresh run for the rest
+            run = new Fragment.Run(f);
+          }
+        }
+        if (page.size() < PAGE) {
+          rows.addAll(run.rows());
+          return rows;
+        }
+        resume = Bytes.successor(page.get(page.size() - 1).key());
+      }
+    }
+
+    @Override
+    public Object[] next() {
+      return out.hasNext() ? out.next() : null;
+    }
+
+    @Override
+    public void close() {
+      out = null;
+    }
+  }
+
+  /** Merges the ranges' partial aggregates. */
+  private static final class MergeAggregate implements Operator {
+    private final Operator input;
+    private final Plan.MergeAggregate plan;
+    private java.util.Iterator<Object[]> out;
+
+    MergeAggregate(Operator input, Plan.MergeAggregate plan) {
+      this.input = input;
+      this.plan = plan;
+    }
+
+    @Override
+    public void open() {
+      out = Fragment.merge(plan.groupCount(), plan.aggs(), drain(input)).iterator();
+    }
+
+    @Override
+    public Object[] next() {
+      return out.hasNext() ? out.next() : null;
+    }
+
+    @Override
+    public void close() {
+      out = null;
+    }
   }
 
   // -----------------------------------------------------------------------------------------------

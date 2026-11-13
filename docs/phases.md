@@ -6,7 +6,7 @@ ranges, and any node answers SQL from `psql`. It is built bottom-up in ten phase
 ends at a **gate**, a test that proves it works, and leaves a design note in `docs/design/`.
 
 This document explains what each phase does, how it works, and what to learn from it.
-**Phases 1–8 are built** (with their measured results); **phases 9–10 are the plan.**
+**Phases 1–9 are built** (with their measured results); **phase 10 is the plan.**
 
 ```
  SQL (8, 9)      psql ─▶ pgwire ─▶ parser ─▶ planner ─▶ distributed executor
@@ -547,27 +547,120 @@ processes.
 
 ---
 
-## Phase 9: Distributed execution and the optimizer *(planned)*
+## Phase 9: Distributed execution and the optimizer
 
-**Goal.** Make queries fast by moving computation to the data, and by choosing good plans.
+**Goal.** Make queries fast by moving computation to the data, and by choosing plans by cost.
 
-**What it will build.**
-- **Rule-based rewrites:** predicate pushdown, projection pruning, constant folding.
-- **Coprocessor pushdown:** filters, projections, partial aggregates and `LIMIT` run on each range
-  leader, next to the data. Only results cross the network, and the gateway merges them (final
-  aggregation, merge sort).
-- **Statistics:** row counts, histograms, distinct counts (HyperLogLog).
-- **A cost-based optimizer:** full scan vs index scan, join algorithm and join order (dynamic
-  programming), with costs that include how many ranges and nodes a plan touches.
-- **`EXPLAIN ANALYZE`:** shows which nodes and ranges each operator touched, and how long it took.
-- *Stretch:* a distributed hash join with a shuffle (exchange) operator.
+**What it builds.**
+- **A coprocessor on every range.** The interface (`Coprocessor`) lives in `distdb-rpc`, below
+  both the storage and the SQL layers, so storage never depends on SQL. The SQL layer implements
+  it (`SqlCoprocessor`), and every store, in the server and in the simulator, plugs it in.
+  - A request carries a **fragment**: a table descriptor, a filter, which columns to keep, an
+    optional partial aggregation (groups and aggregates), and an optional row limit.
+  - The range leader runs it over the versions visible at the transaction's snapshot, with
+    Percolator's rules. It stops with `KeyLocked` at a lock below the snapshot, and the gateway
+    resolves the lock and retries, as for a get.
+  - A run may stop early (a row budget, or a satisfied limit), and the response says where to
+    resume. The client clips each request at its range's end and goes on in the next range.
+- **Pushdown rewrites** of the physical plan (`Pushdown`):
+  - a scan of the primary key, with its pushable conjuncts, becomes a **remote scan**; a conjunct
+    that cannot run on a range stays in a filter above;
+  - an aggregate above it becomes a **partial aggregate** on each range and a **merge** on the
+    gateway: counts add, sums add, min and max compare, and `avg` travels as (sum, count);
+  - a constant `LIMIT n OFFSET m` sends `n + m` as each range's limit;
+  - columns nothing above reads travel as NULL (one byte), so plan positions never change.
 
-**Concepts to learn.** Query optimization; selectivity estimation; cost models; join ordering
-(Selinger); partial and two-phase aggregation; data locality; instrumentation. *Read:* the TiDB
-paper.
+  The gateway sends one fragment per range, all at once, and merges the answers. A transaction
+  with its own writes in the span runs the same fragment locally, over its own view.
+- **Statistics:** `ANALYZE` stores, per table, the row count and range count, and per column the
+  NULLs, a distinct count (HyperLogLog, 4,096 registers, about 1.6% error) and an equi-depth
+  histogram of 32 buckets.
+- **A cost-based optimizer.** Costs are in units of one round trip: a request costs 1, a row moved
+  0.01, a row read on a range 0.002, a row processed on the gateway 0.001. Selectivities come from
+  the histograms and distinct counts, or from PostgreSQL's defaults without statistics.
+  - It picks the cheapest access path: a point get, a full scan on the ranges, or an index scan.
+  - It picks join algorithms by cost: hash, lookup or nested loop.
+  - It orders 3 to 8 inner joins by dynamic programming over subsets (Selinger). Outer joins keep
+    their written order.
+- **`EXPLAIN ANALYZE`** runs the statement. For each operator it prints rows, time and loops, and
+  for a remote scan also the requests, nodes, rows read on the ranges, and rows and bytes received.
+  Time comes from the `Clock` seam, so in the simulator it is simulated time.
+- **`SET distdb_pushdown = off`** turns the pushdown rewrites off, for comparison.
 
-**Gate.** Pushdown shows a **measured** reduction in network bytes and latency on aggregation
-queries.
+**How it works, in one example.** `SELECT region, avg(price) FROM sales GROUP BY region` on a
+20,000-row table split into 40 ranges:
+1. The planner makes `merge aggregate ← remote scan sales (partial aggregate by region)`, keeping
+   only `region` and `price`.
+2. The gateway takes a snapshot timestamp and sends the fragment to all 40 range leaders at once.
+3. Each leader reads its 500 rows at that snapshot and groups them by region. It sends back 8 rows
+   of (region, sum, count).
+4. The gateway adds the sums and counts per region, divides, and answers.
+
+About 49 KB crossed the network, instead of 3 MB. The answer came after one parallel wave instead
+of 119 sequential pages.
+
+**Concepts to learn.**
+- **Data locality:** "move the computation, not the data".
+- **Partial (two-phase) aggregation**, and which aggregates decompose: `avg` does as (sum, count),
+  `count(DISTINCT)` does not.
+- **Snapshot reads in a coprocessor:** why pushdown must see exactly what a plain scan would,
+  locks included.
+- **Selectivity estimation:** histograms, distinct counts, independence assumptions.
+- **HyperLogLog**, and **cost models**.
+- **Join ordering by dynamic programming:** System R / Selinger.
+- **Measuring:** what a simulator's network model must contain before a latency means anything.
+
+*Read:* the TiDB paper (coprocessor and pushdown), Selinger et al. 1979 (access path selection),
+and Flajolet et al. 2007 (HyperLogLog).
+
+**How it's tested.**
+- **`PushdownGateTest` (the gate):** 20,000 rows over 40 ranges and 5 nodes, on the simulator with
+  a wire model: latency, a bandwidth with queueing on each node's inbound link, a read cost per
+  key. Six queries run with pushdown off and on. Answers must match; aggregations must cut bytes
+  tenfold and halve their latency.
+- **sqllogictest with PostgreSQL as the oracle, now 13 files:** the new `optimizer.test` holds
+  joins of 3 to 5 tables written in bad orders, pushed aggregates over 1,000 rows, limits and
+  offsets, correlated subqueries, and a transaction reading its own writes. The files run in memory
+  (`SqlLogicTest`), on the cluster, and on a cluster whose tables split into up to 109 ranges while
+  the statements run (`SqlLogicSimulationTest`).
+- **`SqlBankSimulationTest`:** the Phase 8 bank under faults. Its audits and index audits now run
+  as fragments on the ranges.
+- **`SessionTest`:** the plans pushdown and the optimizer choose, including:
+  - partial aggregation merged on the gateway;
+  - `EXPLAIN ANALYZE`;
+  - own writes;
+  - pushed limits with offsets;
+  - a secondary index chosen when statistics make it selective;
+  - a join order chosen by cost.
+- **`FragmentMergeTest`:** the gateway's merge, including `avg` from (sum, count) and ranges with
+  no rows.
+- **`StatsTest`:** HyperLogLog accuracy (within 5% from 1,000 to 1,000,000 values), merges as
+  unions, histogram fractions, statistics encoding.
+
+**Gate.** Pushdown cut the network bytes of aggregation queries to 1–4%, and their latency about
+30-fold: 3.0 MB and 1.39 s without it, 31–123 KB and 37–44 ms with it. Every answer was the same
+with and without. Numbers and their breakdown are in
+[`0010-distributed-execution.md`](design/0010-distributed-execution.md).
+- In this model, the latency gain is round trips: 119 sequential pages became one parallel wave.
+  Moving the 3 MB takes only 24 ms at 1 Gbit/s.
+- Correctness held everywhere with pushdown on:
+  - 641 sqllogictest queries matched PostgreSQL 18, in memory, on the cluster, and on up to 109
+    splitting ranges;
+  - the SQL bank's audits balanced under faults.
+- Of nine bugs planted on purpose, all were caught: five by unit tests and sqllogictest, three only
+  by the cluster simulations (locks, snapshots and resume keys), and two (an offset, a join order)
+  only after new targeted tests.
+- The full build passes: 276 tests.
+
+*Passed.* (This phase is not committed yet.)
+
+**Lessons.**
+- Pushdown is only safe if a range sees exactly what a plain scan would: the same snapshot, the
+  same locks, and no more than a transaction's committed view. Three planted bugs there were caught
+  only by the cluster simulations.
+- A measurement needs a model of what it measures. Without bandwidth, bytes cost nothing; with
+  10 ms steps, latency was rounding.
+- An oracle checks answers, not choices: performance decisions need tests that pin the plan.
 
 ---
 

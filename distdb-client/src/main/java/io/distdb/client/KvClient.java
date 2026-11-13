@@ -68,6 +68,12 @@ public final class KvClient implements AutoCloseable {
   private final ByteString clientId;
   private final PdClient pd; // null: no range routing, send to the target and follow redirects
   private final RangeCache cache = new RangeCache();
+  private final java.util.concurrent.atomic.AtomicLong requestsSent =
+      new java.util.concurrent.atomic.AtomicLong();
+  private final java.util.concurrent.atomic.AtomicLong bytesSent =
+      new java.util.concurrent.atomic.AtomicLong();
+  private final java.util.concurrent.atomic.AtomicLong bytesReceived =
+      new java.util.concurrent.atomic.AtomicLong();
 
   private final Object seqLock = new Object();
   private long nextSeq = 1; // guarded by seqLock
@@ -259,11 +265,54 @@ public final class KvClient implements AutoCloseable {
   }
 
   /**
+   * What this client has sent and received: requests (attempts included), and bytes on the wire.
+   */
+  public record Traffic(long requests, long bytesSent, long bytesReceived) {
+    /** The traffic since {@code before}. */
+    public Traffic since(Traffic before) {
+      return new Traffic(
+          requests - before.requests,
+          bytesSent - before.bytesSent,
+          bytesReceived - before.bytesReceived);
+    }
+  }
+
+  public Traffic traffic() {
+    return new Traffic(requestsSent.get(), bytesSent.get(), bytesReceived.get());
+  }
+
+  /**
+   * The boundaries of the ranges inside {@code [start, end)} that the range cache knows, in order:
+   * where to cut a span to send one request per range at once. Best effort: a cut the cache does
+   * not know only makes one request cover two ranges, which the usual clipping handles.
+   */
+  public List<byte[]> cachedSplits(byte[] start, byte[] end) {
+    List<byte[]> out = new ArrayList<>();
+    byte[] k = start;
+    while (out.size() < 4096) {
+      RangeCache.Route r = cache.lookup(k);
+      if (r == null || !r.desc.hasEndKey()) {
+        break;
+      }
+      byte[] e = r.desc.getEndKey().toByteArray();
+      if (end != null && java.util.Arrays.compareUnsigned(e, end) >= 0) {
+        break;
+      }
+      if (java.util.Arrays.compareUnsigned(e, k) <= 0) {
+        break;
+      }
+      out.add(e);
+      k = e;
+    }
+    return out;
+  }
+
+  /**
    * Sends {@code request} to the range holding its key, retrying whatever is worth retrying (leader
    * changes, splits, lost messages) until {@code timeout}, and returns the answer, transactional
    * errors included ({@code KeyLocked}, {@code WriteConflict}, ...). For the transaction layer: its
    * commands are idempotent and carry no request id, so a retry is always safe. A scan of either
-   * kind is cut at the end of the range, with a resume key there.
+   * kind (and a coprocessor request) is cut at the end of the range, with a resume key there.
    */
   public CompletableFuture<KvResponse> send(KvRequest request, Duration timeout) {
     return new Call(request, false, deadline(timeout)).start();
@@ -445,6 +494,11 @@ public final class KvClient implements AutoCloseable {
                   || beyond.compare(request.getTxnScan().getEndKey(), end) > 0)) {
             r.setTxnScan(request.getTxnScan().toBuilder().setEndKey(end));
             cutAt = end;
+          } else if (request.hasCoprocessor()
+              && (!request.getCoprocessor().hasEndKey()
+                  || beyond.compare(request.getCoprocessor().getEndKey(), end) > 0)) {
+            r.setCoprocessor(request.getCoprocessor().toBuilder().setEndKey(end));
+            cutAt = end;
           } else if (request.hasScanLocks()) {
             cutAt = end; // the node scans to the end of its range
           }
@@ -454,7 +508,10 @@ public final class KvClient implements AutoCloseable {
       CompletableFuture<KvResponse> answer;
       sentTo = address;
       try {
-        answer = channel(sentTo).call(r.build(), timeout);
+        KvRequest built = r.build();
+        requestsSent.incrementAndGet();
+        bytesSent.addAndGet(built.getSerializedSize());
+        answer = channel(sentTo).call(built, timeout);
       } catch (RuntimeException e) {
         answer = CompletableFuture.failedFuture(e);
       }
@@ -486,6 +543,7 @@ public final class KvClient implements AutoCloseable {
         }
         return;
       }
+      bytesReceived.addAndGet(response.getSerializedSize());
       if (!response.hasError()) {
         if (cutAt != null) {
           // The page reached the end of this range: the scan goes on in the next one.
@@ -498,6 +556,13 @@ public final class KvClient implements AutoCloseable {
             response =
                 response.toBuilder()
                     .setTxnScan(response.getTxnScan().toBuilder().setResumeKey(cutAt))
+                    .build();
+          } else if (response.hasCoprocessor()
+              && !response.getCoprocessor().hasResumeKey()
+              && !response.getCoprocessor().getSatisfied()) {
+            response =
+                response.toBuilder()
+                    .setCoprocessor(response.getCoprocessor().toBuilder().setResumeKey(cutAt))
                     .build();
           } else if (response.hasScanLocks() && !response.getScanLocks().hasResumeKey()) {
             response =
@@ -607,6 +672,7 @@ public final class KvClient implements AutoCloseable {
       case SCAN -> request.getScan().getStartKey().toByteArray();
       case TXN_GET -> request.getTxnGet().getKey().toByteArray();
       case TXN_SCAN -> request.getTxnScan().getStartKey().toByteArray();
+      case COPROCESSOR -> request.getCoprocessor().getStartKey().toByteArray();
       case SCAN_LOCKS -> request.getScanLocks().getStartKey().toByteArray();
       case PREWRITE -> request.getPrewrite().getMutation().getKey().toByteArray();
       case TXN_COMMIT -> request.getTxnCommit().getKey().toByteArray();

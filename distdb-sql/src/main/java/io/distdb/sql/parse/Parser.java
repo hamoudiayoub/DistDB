@@ -247,10 +247,12 @@ public final class Parser {
       case "show" -> show();
       case "explain" -> {
         advance();
-        if (peek().is("analyze") || peek().is("analyse")) {
-          throw unsupported("EXPLAIN ANALYZE (Phase 9)");
-        }
-        yield new Explain(statement());
+        boolean analyze = accept("analyze") || accept("analyse");
+        yield new Explain(statement(), analyze);
+      }
+      case "analyze", "analyse" -> {
+        advance();
+        yield new Ast.Analyze(peek().kind() == Kind.EOF || peek().isOp(";") ? null : identifier());
       }
       default -> throw unexpected();
     };

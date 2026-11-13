@@ -149,6 +149,10 @@ public final class Store implements KvHandler, AutoCloseable {
       long rangeId, RangeDescriptor descriptor, RaftNode.Status raft, long applied) {}
 
   private final Config config;
+
+  /** Runs pushed-down query fragments; null until the server plugs one in. */
+  private volatile io.distdb.rpc.Coprocessor coprocessor;
+
   private final KvEngine engine;
   private final Transport transport;
   private final PdClient pd;
@@ -344,6 +348,15 @@ public final class Store implements KvHandler, AutoCloseable {
     markDirty(r);
   }
 
+  /** Plugs in the program runner for coprocessor requests (the SQL layer's). */
+  public void coprocessor(io.distdb.rpc.Coprocessor c) {
+    this.coprocessor = c;
+  }
+
+  io.distdb.rpc.Coprocessor coprocessor() {
+    return coprocessor;
+  }
+
   /** Whether every key {@code request} touches is in {@code d}'s span. */
   static boolean inSpan(KvRequest request, RangeDescriptor d) {
     if (request.hasScan()) {
@@ -353,6 +366,11 @@ public final class Store implements KvHandler, AutoCloseable {
     }
     if (request.hasTxnScan()) {
       var s = request.getTxnScan();
+      return Ranges.containsSpan(
+          d, s.getStartKey().toByteArray(), s.hasEndKey() ? s.getEndKey().toByteArray() : null);
+    }
+    if (request.hasCoprocessor()) {
+      var s = request.getCoprocessor();
       return Ranges.containsSpan(
           d, s.getStartKey().toByteArray(), s.hasEndKey() ? s.getEndKey().toByteArray() : null);
     }

@@ -41,7 +41,15 @@ public final class Catalog {
   private static final int FORMAT = 1;
 
   /** The descriptors of one catalog version. */
-  public record Snapshot(long version, Map<String, TableDesc> tables) {
+  public record Snapshot(
+      long version,
+      Map<String, TableDesc> tables,
+      Map<Long, io.distdb.sql.stats.TableStats> stats) {
+
+    /** The table's statistics, or null if it was never analyzed. */
+    public io.distdb.sql.stats.TableStats statsOf(TableDesc t) {
+      return stats.get(t.id());
+    }
 
     public Optional<TableDesc> find(String name) {
       return Optional.ofNullable(tables.get(name));
@@ -77,7 +85,7 @@ public final class Catalog {
     }
   }
 
-  private volatile Snapshot cached = new Snapshot(-1, Map.of());
+  private volatile Snapshot cached = new Snapshot(-1, Map.of(), Map.of());
 
   /** The catalog as of {@code txn}'s snapshot (its own schema writes included). */
   public Snapshot load(KvTxn txn) {
@@ -93,7 +101,12 @@ public final class Catalog {
       TableDesc t = decode(e.value());
       tables.put(t.name(), t);
     }
-    Snapshot fresh = new Snapshot(version, Map.copyOf(tables));
+    Map<Long, io.distdb.sql.stats.TableStats> stats = new HashMap<>();
+    byte[] statsStart = statsPrefix();
+    for (KvTxn.Entry e : txn.scan(statsStart, Bytes.prefixEnd(statsStart).orElseThrow(), 0)) {
+      stats.put(statsTableId(e.key()), io.distdb.sql.stats.TableStats.decode(e.value()));
+    }
+    Snapshot fresh = new Snapshot(version, Map.copyOf(tables), Map.copyOf(stats));
     // A version this transaction wrote itself is not committed: never cache it.
     if (version > c.version() && version != txn.startTs()) {
       cached = fresh;
@@ -119,6 +132,7 @@ public final class Catalog {
 
   public static void remove(KvTxn txn, Snapshot snapshot, TableDesc t) {
     txn.delete(descKey(t.id()));
+    txn.delete(statsKey(t.id()));
     bump(txn, snapshot);
   }
 
@@ -159,6 +173,28 @@ public final class Catalog {
         .writeString("names")
         .writeString(name)
         .toByteArray();
+  }
+
+  /** Writes a table's statistics (and bumps the version, so plans see them). */
+  public static void putStats(
+      KvTxn txn, Snapshot snapshot, long tableId, io.distdb.sql.stats.TableStats stats) {
+    txn.put(statsKey(tableId), stats.encode());
+    bump(txn, snapshot);
+  }
+
+  static byte[] statsPrefix() {
+    return new KeyWriter().writeLong(SYSTEM_TABLE).writeString("stats").toByteArray();
+  }
+
+  static byte[] statsKey(long id) {
+    return new KeyWriter().writeLong(SYSTEM_TABLE).writeString("stats").writeLong(id).toByteArray();
+  }
+
+  private static long statsTableId(byte[] key) {
+    KeyReader r = new KeyReader(key);
+    r.readLong();
+    r.readString();
+    return r.readLong();
   }
 
   static byte[] descPrefix() {

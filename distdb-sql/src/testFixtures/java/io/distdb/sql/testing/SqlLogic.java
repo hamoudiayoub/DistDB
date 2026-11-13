@@ -50,6 +50,7 @@ public final class SqlLogic {
           "dml.test",
           "index.test",
           "transaction.test",
+          "optimizer.test",
           "fuzz.test");
 
   /** A failed statement, with its SQLSTATE. */

@@ -515,3 +515,88 @@ first run:
 - **Lesson:** a planted bug that survives says what the tests never do. Two remedies: widen the
   workload when the gap is an operation it skips; write a targeted test when the gap is timing
   that random runs rarely line up.
+
+---
+
+## 2026-11-12 — Projection pruning broke a correlated EXISTS
+
+- **Symptom:** with pushdown on, `subquery.test` line 32 answered wrongly. The query was a
+  correlated `EXISTS` whose subquery compares to a column of the outer table. The remote scan sent
+  that column as NULL, so the subquery never matched.
+- **Cause:** pruning keeps the columns the plan above reads, using `columnsRead`, which walks an
+  expression's column references. A conjunct that cannot run on the ranges (it holds a correlated
+  subquery) stays in a Filter on the gateway, and its subquery reads the row through outer
+  references. `columnsRead` does not descend into subqueries, so those reads were invisible, and
+  the columns were pruned.
+- **Fix:** when a conjunct kept on the gateway holds a correlated subquery, the remote scan keeps
+  every column. Planted bug Q5 (pruning ignores what the gateway's filter reads) now checks it.
+- **Lesson:** NULLing a column is silent: nothing fails until something reads it. A "what does
+  this read" analysis has to see through every way of reading, outer references included. And an
+  oracle with a few correlated queries found what my own tests did not.
+
+---
+
+## 2026-11-12 — A latency gate on a network with no bandwidth
+
+- **Symptom:** a first look at measuring the gate showed three problems with the simulator as it
+  was.
+  - Its network had latency (1–5 ms) but no bandwidth: a 3 MB response arrived as fast as a 30-byte
+    one, so bytes could not cost time.
+  - `Cluster.await` advanced time in 10 ms steps, so latencies were rounded up to the next 10 ms
+    at every wait. A plain scan waits about 120 times per query, so it would have been charged up
+    to about a second of rounding.
+  - The fault-free cluster still lost 2% of client messages, and a 40-range fan-out sends 80, so
+    most fan-outs would have waited for a retry timeout. The latency would have measured timeouts.
+- **Fix:** a wire model, `ShardedKvSimulation.Wire`, used only by the measurement cluster:
+  - a bandwidth per node, with each inbound link carrying one message at a time;
+  - a read cost per key on the range;
+  - no losses.
+
+  `await` now runs one task at a time and stops at the task that completes the future, so the
+  clock reads the exact completion time. Every other run keeps `Wire.NONE`, and their seeds replay
+  unchanged.
+- **Lesson:** a measurement is only as good as the model of what it measures. The decomposition
+  also matters. In this model, the 30× latency gain comes from round trips: 119 sequential pages
+  become one parallel wave. The transfer of 3 MB at 1 Gbit/s is only 24 ms of the 1.39 s. Bytes
+  are a separate win, which grows as the network gets slower or busier.
+
+---
+
+## 2026-11-12 — A cost-based planner changed plans two tests had pinned
+
+- **Symptom:** after statistics and costs, `SessionTest` expected `remote scan branch b filter
+  name = 'south'` and got `index scan branch b on branch_name_key`. Later, `SqlClusterTest`
+  expected an index scan on a four-row table and got one filtered scan on the table's range.
+- **Cause:** not a bug. `name` is UNIQUE, so `name = 'south'` matches at most one row: one get
+  (cost about 2) beats scanning the table on its ranges (about 3). The rule-based planner never
+  compared the two.
+- **Fix:** both tests now check what they were written for. The first still checks that each
+  side's conjunct sits below the join, on its own side, and expects the index lookup. The second
+  checks that an index built through one node is used and maintained through another. It uses a
+  unique index, which a lookup is estimated to reach in one row, and expects a duplicate inserted
+  through another node to fail with 23505.
+- **Lesson:** once a planner chooses by cost, a plan test tests the costs too. Pin the property
+  the test is about (where a predicate runs), and expect the operator only where the costs are
+  clear.
+
+---
+
+## 2026-11-12 — Two planted bugs no test could see: an offset and a join order
+
+- **Symptom:** two planted bugs passed everything: the unit tests, sqllogictest in memory and on
+  two clusters, the gate, and 30 SQL bank seeds.
+  - Q7: a pushed limit forgets the offset.
+  - Q8: the join-order search keeps the costliest plan.
+- **Cause:**
+  - **Q7:** a limit is pushed only when no sort sits above it. Every `LIMIT ... OFFSET` in the
+    oracle files has an `ORDER BY`, because PostgreSQL leaves the order undefined without one. So
+    the oracle never reached the pushed limit.
+  - **Q8:** a bad join order still gives the right answer, and the join-order test checked only
+    the answer.
+- **Fix:** two `SessionTest` cases.
+  - One compares a pushed `LIMIT 3 OFFSET 4` with pushdown off, and with known rows: our scans
+    return rows in key order, so the result is defined here.
+  - One asserts the plan of a three-table join written from its biggest table: a lookup join into
+    the big table, and no scan of it.
+- **Lesson:** an oracle checks answers, not choices. A decision made only for speed needs a test
+  that pins the decision. And a reference implementation cannot check what it leaves undefined.

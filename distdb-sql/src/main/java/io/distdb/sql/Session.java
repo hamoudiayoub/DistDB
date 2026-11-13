@@ -67,7 +67,8 @@ public final class Session {
           Map.entry("extra_float_digits", "1"),
           Map.entry("max_identifier_length", "63"),
           Map.entry("is_superuser", "on"),
-          Map.entry("intervalstyle", "postgres"));
+          Map.entry("intervalstyle", "postgres"),
+          Map.entry("distdb_pushdown", "on"));
 
   private final Engine engine;
   private final Map<String, String> vars = new HashMap<>();
@@ -267,7 +268,8 @@ public final class Session {
           outsideBlock("DROP TABLE");
           yield SchemaChanges.dropTable(engine.catalog(), engine.store(), dt);
         }
-        case Ast.Explain e -> inTransaction(t -> explain(t, e.statement(), params));
+        case Ast.Explain e -> inTransaction(t -> explain(t, e.statement(), e.analyze(), params));
+        case Ast.Analyze a -> inTransaction(t -> analyze(t, a));
         case Ast.QueryStatement q -> inTransaction(t -> runBound(t, s, p, params));
         case Ast.Insert i -> inTransaction(t -> runBound(t, s, p, params));
         case Ast.Update u -> inTransaction(t -> runBound(t, s, p, params));
@@ -384,40 +386,65 @@ public final class Session {
     }
   }
 
+  /** Whether statements push work to the ranges ({@code SET distdb_pushdown = on|off}). */
+  boolean pushdown() {
+    String v = setting("distdb_pushdown");
+    return v == null
+        || !(v.equalsIgnoreCase("off") || v.equalsIgnoreCase("false") || v.equals("0"));
+  }
+
+  private Bound bind(Catalog.Snapshot snapshot, Ast.Statement s, Prepared p) {
+    if (p != null && p.bound != null && p.catalogVersion == snapshot.version()) {
+      return p.bound;
+    }
+    Binder binder = new Binder(snapshot, p == null ? List.of() : p.paramTypes);
+    Bound bound = binder.bind(s);
+    if (p != null) {
+      p.bound = bound;
+      p.catalogVersion = snapshot.version();
+    }
+    return bound;
+  }
+
+  /** The physical plan a bound statement runs: the query, or the rows a write changes. */
+  private Plan physical(Bound bound, Catalog.Snapshot snapshot) {
+    Plan logical =
+        switch (bound) {
+          case Bound.Query q -> q.plan();
+          case Bound.Insert i -> i.source();
+          case Bound.Update u -> u.source();
+          case Bound.Delete d -> d.source();
+        };
+    return Planner.plan(logical, pushdown(), snapshot);
+  }
+
   private Result runBound(KvTxn t, Ast.Statement s, Prepared p, Object[] params) {
     Catalog.Snapshot snapshot = engine.catalog().load(t);
-    Bound bound;
-    if (p != null && p.bound != null && p.catalogVersion == snapshot.version()) {
-      bound = p.bound;
-    } else {
-      Binder binder = new Binder(snapshot, p == null ? List.of() : p.paramTypes);
-      bound = binder.bind(s);
-      if (p != null) {
-        p.bound = bound;
-        p.catalogVersion = snapshot.version();
-      }
-    }
+    Bound bound = bind(snapshot, s, p);
     if (params.length < countParams(p)) {
       throw new SqlException(
           SqlState.PROTOCOL_VIOLATION, "not enough parameters: " + params.length);
     }
-    ExecContext ctx = new ExecContext(t, engine.store(), params);
+    ExecContext ctx = new ExecContext(t, engine.store(), params).pushdown(pushdown());
+    return run(bound, physical(bound, snapshot), ctx);
+  }
+
+  private Result run(Bound bound, Plan plan, ExecContext ctx) {
     return switch (bound) {
       case Bound.Query q -> {
-        Plan plan = Planner.plan(q.plan());
         List<Object[]> rows = Operators.drain(Operators.build(plan, ctx));
         yield new Result("SELECT " + rows.size(), columnsOf(bound), rows, List.of());
       }
       case Bound.Insert i -> {
-        Writes.Outcome o = Writes.insert(i, ctx);
+        Writes.Outcome o = Writes.insert(i, plan, ctx);
         yield new Result("INSERT 0 " + o.count(), columnsOf(bound), o.returning(), List.of());
       }
       case Bound.Update u -> {
-        Writes.Outcome o = Writes.update(u, ctx);
+        Writes.Outcome o = Writes.update(u, plan, ctx);
         yield new Result("UPDATE " + o.count(), columnsOf(bound), o.returning(), List.of());
       }
       case Bound.Delete d -> {
-        Writes.Outcome o = Writes.delete(d, ctx);
+        Writes.Outcome o = Writes.delete(d, plan, ctx);
         yield new Result("DELETE " + o.count(), columnsOf(bound), o.returning(), List.of());
       }
     };
@@ -427,30 +454,48 @@ public final class Session {
     return p == null || p.paramTypes == null ? 0 : p.paramTypes.size();
   }
 
-  private Result explain(KvTxn t, Ast.Statement s, Object[] params) {
+  /**
+   * {@code EXPLAIN}: the physical plan. {@code EXPLAIN ANALYZE}: the statement run (writes
+   * included, as in PostgreSQL), each operator with what it did: rows, time, and for remote scans
+   * the requests, nodes, rows read on the ranges and bytes received.
+   */
+  private Result explain(KvTxn t, Ast.Statement s, boolean analyze, Object[] params) {
     Catalog.Snapshot snapshot = engine.catalog().load(t);
     List<String> lines = new ArrayList<>();
-    switch (s) {
-      case Ast.QueryStatement q -> {
-        Bound.Query b = (Bound.Query) new Binder(snapshot, List.of()).bind(s);
-        lines.addAll(PlanPrinter.render(Planner.plan(b.plan())));
+    if (!(s instanceof Ast.QueryStatement
+        || s instanceof Ast.Insert
+        || s instanceof Ast.Update
+        || s instanceof Ast.Delete)) {
+      lines.add(s.getClass().getSimpleName().toLowerCase(Locale.ROOT));
+    } else {
+      Bound bound = new Binder(snapshot, List.of()).bind(s);
+      Plan plan = physical(bound, snapshot);
+      String head =
+          switch (bound) {
+            case Bound.Query q -> null;
+            case Bound.Insert i -> "insert into " + i.table().name();
+            case Bound.Update u -> "update " + u.table().name();
+            case Bound.Delete d -> "delete from " + d.table().name();
+          };
+      List<String> body;
+      if (analyze) {
+        ExecContext ctx =
+            ExecContext.analyzing(t, engine.store(), params, engine.clock()).pushdown(pushdown());
+        long started = engine.clock().nanoTime();
+        Result r = run(bound, plan, ctx);
+        long nanos = engine.clock().nanoTime() - started;
+        body = PlanPrinter.render(plan, ctx.opStats(), ctx.remoteStats());
+        body = new ArrayList<>(body);
+        body.add(String.format(Locale.ROOT, "%s in %.3f ms", r.tag(), nanos / 1e6));
+      } else {
+        body = PlanPrinter.render(plan);
       }
-      case Ast.Insert i -> {
-        Bound.Insert b = (Bound.Insert) new Binder(snapshot, List.of()).bind(s);
-        lines.add("insert into " + b.table().name());
-        PlanPrinter.render(Planner.plan(b.source())).forEach(l -> lines.add("  -> " + l));
+      if (head == null) {
+        lines.addAll(body);
+      } else {
+        lines.add(head);
+        body.forEach(l -> lines.add("  -> " + l));
       }
-      case Ast.Update u -> {
-        Bound.Update b = (Bound.Update) new Binder(snapshot, List.of()).bind(s);
-        lines.add("update " + b.table().name());
-        PlanPrinter.render(Planner.plan(b.source())).forEach(l -> lines.add("  -> " + l));
-      }
-      case Ast.Delete d -> {
-        Bound.Delete b = (Bound.Delete) new Binder(snapshot, List.of()).bind(s);
-        lines.add("delete from " + b.table().name());
-        PlanPrinter.render(Planner.plan(b.source())).forEach(l -> lines.add("  -> " + l));
-      }
-      default -> lines.add(s.getClass().getSimpleName().toLowerCase(Locale.ROOT));
     }
     List<Object[]> rows = new ArrayList<>();
     for (String l : lines) {
@@ -458,6 +503,22 @@ public final class Session {
     }
     return new Result(
         "EXPLAIN", List.of(new Result.Column("QUERY PLAN", Type.TEXT)), rows, List.of());
+  }
+
+  /** {@code ANALYZE [table]}: statistics for one table, or for all of them. */
+  private Result analyze(KvTxn t, Ast.Analyze a) {
+    Catalog.Snapshot snapshot = engine.catalog().load(t);
+    List<io.distdb.sql.catalog.TableDesc> tables =
+        a.table() == null
+            ? List.copyOf(snapshot.tables().values())
+            : List.of(snapshot.table(a.table()));
+    for (io.distdb.sql.catalog.TableDesc d : tables) {
+      byte[] start = io.distdb.sql.encoding.RowCodec.tablePrefix(d.id());
+      byte[] end = io.distdb.common.Bytes.prefixEnd(start).orElseThrow();
+      int ranges = engine.store().rangeCount(start, end);
+      Catalog.putStats(t, snapshot, d.id(), io.distdb.sql.stats.Analyzer.analyze(t, d, ranges));
+    }
+    return Result.command("ANALYZE");
   }
 
   /** Closes an open transaction, if any (the connection is going away). */

@@ -2,6 +2,8 @@ package io.distdb.txn;
 
 import com.google.protobuf.ByteString;
 import io.distdb.common.Bytes;
+import io.distdb.rpc.proto.CoprocessorRequest;
+import io.distdb.rpc.proto.CoprocessorResponse;
 import io.distdb.rpc.proto.Error;
 import io.distdb.rpc.proto.KvRequest;
 import io.distdb.rpc.proto.KvResponse;
@@ -137,6 +139,68 @@ public final class Txn {
             return CompletableFuture.completedFuture(false);
           }
           return scanFrom(r.getTxnScan().getResumeKey().toByteArray(), end, out, need, deadline);
+        });
+  }
+
+  /**
+   * Whether this transaction has buffered writes in {@code [start, end)} ({@code end} null: no
+   * bound).
+   */
+  public boolean hasWritesIn(byte[] start, byte[] end) {
+    byte[] k = writes.ceilingKey(start);
+    return k != null && (end == null || Arrays.compareUnsigned(k, end) < 0);
+  }
+
+  /**
+   * Runs a pushed-down program over {@code [start, end)} at this transaction's snapshot, on the
+   * ranges that hold it: one chain of requests per range the client knows, all at once, each
+   * following its resume keys. A lock met is resolved and the request retried, as for reads. The
+   * responses come back in key order. The program does not see this transaction's own writes; the
+   * caller checks {@link #hasWritesIn}.
+   */
+  public CompletableFuture<List<CoprocessorResponse>> coprocessor(
+      byte[] start, byte[] end, byte[] program) {
+    List<byte[]> cuts = client.kv().cachedSplits(start, end);
+    List<CompletableFuture<List<CoprocessorResponse>>> parts = new ArrayList<>();
+    long deadline = deadline();
+    byte[] from = start;
+    for (byte[] cut : cuts) {
+      parts.add(chain(from, cut, program, new ArrayList<>(), deadline));
+      from = cut;
+    }
+    parts.add(chain(from, end, program, new ArrayList<>(), deadline));
+    return CompletableFuture.allOf(parts.toArray(CompletableFuture[]::new))
+        .thenApply(v -> {
+          List<CoprocessorResponse> all = new ArrayList<>();
+          for (CompletableFuture<List<CoprocessorResponse>> p : parts) {
+            all.addAll(p.join());
+          }
+          return all;
+        });
+  }
+
+  private CompletableFuture<List<CoprocessorResponse>> chain(
+      byte[] start, byte[] end, byte[] program, List<CoprocessorResponse> out, long deadline) {
+    CoprocessorRequest.Builder c =
+        CoprocessorRequest.newBuilder()
+            .setStartKey(ByteString.copyFrom(start))
+            .setReadTs(startTs)
+            .setProgram(ByteString.copyFrom(program));
+    if (end != null) {
+      c.setEndKey(ByteString.copyFrom(end));
+    }
+    return read(KvRequest.newBuilder().setCoprocessor(c).build(), deadline)
+        .thenCompose(r -> {
+          CoprocessorResponse resp = r.getCoprocessor();
+          out.add(resp);
+          if (!resp.hasResumeKey() || resp.getSatisfied()) {
+            return CompletableFuture.completedFuture(out);
+          }
+          byte[] resume = resp.getResumeKey().toByteArray();
+          if (end != null && Arrays.compareUnsigned(resume, end) >= 0) {
+            return CompletableFuture.completedFuture(out);
+          }
+          return chain(resume, end, program, out, deadline);
         });
   }
 

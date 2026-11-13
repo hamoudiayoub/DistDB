@@ -52,6 +52,7 @@ message KvRequest {
     CheckTxnStatusRequest check_txn_status = 21;
     ScanLocksRequest scan_locks = 22;
     SetTxnFloorRequest set_txn_floor = 23;
+    CoprocessorRequest coprocessor = 24;
     // For the placement driver; see pd.proto.
     PdRequest pd = 20;
   }
@@ -101,6 +102,7 @@ message KvResponse {
     CheckTxnStatusResponse check_txn_status = 21;
     ScanLocksResponse scan_locks = 22;
     SetTxnFloorResponse set_txn_floor = 23;
+    CoprocessorResponse coprocessor = 24;
     PdResponse pd = 20;
   }
 }

@@ -385,6 +385,76 @@ public final class Percolator {
     return ok(KvResponse.newBuilder().setTxnScan(out));
   }
 
+  /**
+   * Runs a pushed-down program over the entries of {@code [start, end)} visible at {@code read_ts},
+   * with the same rules as {@link #scan}: a lock at or below the snapshot stops it with KeyLocked,
+   * and the reader resolves it. The program may stop early; the response then says where to resume.
+   */
+  static KvResponse coprocessor(
+      KvEngine engine,
+      io.distdb.rpc.proto.CoprocessorRequest c,
+      Limits limits,
+      io.distdb.rpc.Coprocessor runner,
+      int self) {
+    if (runner == null) {
+      return KvErrors.invalidArgument("this node runs no coprocessor");
+    }
+    if (c.getReadTs() < limits.safePoint()) {
+      return tooOld(limits.safePoint());
+    }
+    io.distdb.rpc.Coprocessor.Run run;
+    try {
+      run = runner.start(c.getProgram().toByteArray());
+    } catch (IllegalArgumentException e) {
+      return KvErrors.invalidArgument("bad coprocessor program: " + e.getMessage());
+    }
+    byte[] start = c.getStartKey().toByteArray();
+    byte[] end = c.hasEndKey() ? c.getEndKey().toByteArray() : null;
+    TreeSet<byte[]> keys = new TreeSet<>(Bytes.COMPARATOR);
+    for (byte family : new byte[] {LOCK, WRITE}) {
+      byte[] from = cf(family, MvccKey.prefix(start));
+      byte[] to = end != null ? cf(family, MvccKey.prefix(end)) : new byte[] {(byte) (family + 1)};
+      try (KvIterator it = engine.scan(from, to)) {
+        while (it.hasNext()) {
+          keys.add(userKeyOf(it.next().key()));
+        }
+      }
+    }
+    io.distdb.rpc.proto.CoprocessorResponse.Builder out =
+        io.distdb.rpc.proto.CoprocessorResponse.newBuilder().setServedBy(self);
+    long rows = 0;
+    long bytes = 0;
+    java.util.Iterator<byte[]> it = keys.iterator();
+    while (it.hasNext()) {
+      byte[] key = it.next();
+      Optional<LockInfo> lock = lock(engine, key);
+      if (lock.isPresent() && lock.get().getStartTs() <= c.getReadTs()) {
+        return KvErrors.keyLocked(
+            lock.get(), "locked by the transaction at " + lock.get().getStartTs());
+      }
+      Optional<byte[]> v = visible(engine, key, c.getReadTs());
+      if (v.isEmpty()) {
+        continue;
+      }
+      rows++;
+      bytes += key.length + v.get().length;
+      if (!run.accept(key, v.get())) {
+        if (run.satisfied()) {
+          out.setSatisfied(true);
+        } else if (it.hasNext()) {
+          out.setResumeKey(ByteString.copyFrom(it.next()));
+        }
+        break;
+      }
+    }
+    return ok(
+        KvResponse.newBuilder()
+            .setCoprocessor(
+                out.setResult(ByteString.copyFrom(run.finish()))
+                    .setRowsScanned(rows)
+                    .setBytesScanned(bytes)));
+  }
+
   /** Locks with {@code start_ts < max_ts} from {@code start_key} to the end of {@code d}. */
   static KvResponse scanLocks(KvEngine engine, ScanLocksRequest s, RangeDescriptor d) {
     byte[] from = cf(LOCK, MvccKey.prefix(s.getStartKey().toByteArray()));

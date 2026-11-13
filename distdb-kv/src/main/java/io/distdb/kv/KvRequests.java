@@ -30,6 +30,12 @@ final class KvRequests {
         }
       }
       case SCAN_LOCKS -> key(request.getScanLocks().getStartKey(), options.maxKeyBytes() + 1);
+      case COPROCESSOR -> {
+        key(request.getCoprocessor().getStartKey(), options.maxKeyBytes() + 1);
+        if (request.getCoprocessor().hasEndKey()) {
+          key(request.getCoprocessor().getEndKey(), options.maxKeyBytes() + 1);
+        }
+      }
       case SCAN -> {
         key(request.getScan().getStartKey(), options.maxKeyBytes() + 1);
         if (request.getScan().hasEndKey()) {
@@ -83,7 +89,7 @@ final class KvRequests {
   /** Reads, served after ReadIndex: Get, Scan and the transactional reads. */
   static boolean isRead(KvRequest r) {
     return switch (r.getOpCase()) {
-      case GET, SCAN, TXN_GET, TXN_SCAN, SCAN_LOCKS -> true;
+      case GET, SCAN, TXN_GET, TXN_SCAN, SCAN_LOCKS, COPROCESSOR -> true;
       default -> false;
     };
   }
@@ -123,6 +129,7 @@ final class KvRequests {
       case TXN_GET -> r.getTxnGet().getKey().toByteArray();
       case TXN_SCAN -> r.getTxnScan().getStartKey().toByteArray();
       case SCAN_LOCKS -> r.getScanLocks().getStartKey().toByteArray();
+      case COPROCESSOR -> r.getCoprocessor().getStartKey().toByteArray();
       case PREWRITE -> r.getPrewrite().getMutation().getKey().toByteArray();
       case TXN_COMMIT -> r.getTxnCommit().getKey().toByteArray();
       case TXN_ROLLBACK -> r.getTxnRollback().getKey().toByteArray();

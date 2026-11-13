@@ -28,6 +28,19 @@ public interface KvTxn {
 
   void delete(byte[] key);
 
+  /** One range's answer to a pushed-down fragment. */
+  record CopResult(byte[] result, long rowsScanned, long bytesScanned, int servedBy) {}
+
+  /** Whether this transaction has buffered writes in {@code [start, end)}. */
+  boolean hasWritesIn(byte[] start, byte[] end);
+
+  /**
+   * Runs {@code program} (a coprocessor fragment) over {@code [start, end)} at this transaction's
+   * snapshot, on the ranges that hold it; their answers in key order. It does not see this
+   * transaction's own writes: callers check {@link #hasWritesIn} first.
+   */
+  List<CopResult> coprocessor(byte[] start, byte[] end, byte[] program);
+
   /** Commits; returns the commit timestamp (the start timestamp if nothing was written). */
   long commit();
 

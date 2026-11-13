@@ -17,8 +17,8 @@ placeholder name.)
 | 6     | Multi-Raft and sharding: ranges, placement driver, splits    | done    |
 | 7     | Percolator transactions, snapshot isolation                  | done    |
 | 8     | SQL: parser, planner, executor, PostgreSQL wire protocol     | done    |
-| 9     | Distributed execution and the cost-based optimizer           | next    |
-| 10    | Hardening and benchmarks                                     | planned |
+| 9     | Distributed execution and the cost-based optimizer           | done    |
+| 10    | Hardening and benchmarks                                     | next    |
 
 Phase 2's gate, run at full scale:
 
@@ -88,6 +88,17 @@ recreates schema `public`), and regenerate the random queries:
 ./gradlew :distdb-sql:test --tests '*SqlLogicTest*' -Ddistdb.slt.fuzz=400 "-Ddistdb.slt.complete=jdbc:postgresql://localhost:5432/scratch?user=postgres"
 ```
 
+Phase 9's gate is `PushdownGateTest`: a measured cut in network bytes and latency on aggregation
+queries. A 20,000-row table spread over 40 ranges and 5 nodes, on the simulator with a wire model
+(1–5 ms latency, 1 Gbit/s links, 1 µs per key read). Each query runs with pushdown off and on, and
+must answer the same. Aggregations must move at least ten times fewer bytes and answer at least
+twice as fast; they moved about 1% of the bytes and answered about 30 times sooner (numbers in
+[`docs/design/0010-distributed-execution.md`](docs/design/0010-distributed-execution.md)):
+
+```bash
+./gradlew :distdb-sim:test --tests '*PushdownGateTest' -i
+```
+
 ## Try it
 
 ```bash
@@ -147,6 +158,17 @@ UPDATE accounts SET balance = balance + 30 WHERE id = 2;
 COMMIT;
 CREATE INDEX accounts_owner ON accounts (owner);
 EXPLAIN SELECT * FROM accounts WHERE owner = 'bob';
+```
+
+Filters and aggregates run on the ranges, next to the data, and the gateway merges what they send
+(Phase 9). `ANALYZE` gathers the statistics the planner costs plans with, and `EXPLAIN ANALYZE`
+shows what each operator did: rows, time, ranges, nodes, requests and bytes:
+
+```sql
+ANALYZE accounts;
+EXPLAIN ANALYZE SELECT owner, count(*), sum(balance) FROM accounts GROUP BY owner;
+SET distdb_pushdown = off;  -- every row to the gateway, as in Phase 8
+EXPLAIN ANALYZE SELECT owner, count(*), sum(balance) FROM accounts GROUP BY owner;
 ```
 
 Every node with `--sql` sees the same tables. Kill any one node, PD or data, and the cluster keeps serving. A single replicated group without a

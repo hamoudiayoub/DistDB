@@ -18,4 +18,9 @@ public interface KvStore {
    * schema survives them.
    */
   void fence(long ts);
+
+  /** How many ranges hold {@code [start, end)}, as far as this node knows (for statistics). */
+  default int rangeCount(byte[] start, byte[] end) {
+    return 1;
+  }
 }

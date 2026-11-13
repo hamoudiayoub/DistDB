@@ -57,6 +57,39 @@ public sealed interface Plan {
       List<Col> columns)
       implements Plan {}
 
+  /**
+   * A scan of a table's primary index (the whole table, or a prefix and range of its key) run on
+   * the ranges themselves: each applies {@code filter}, and either sends back the rows (with only
+   * the {@code keep} columns; the others NULL) or aggregates them into partial states by {@code
+   * groups} (then {@code columns} are the partial states, for a {@link MergeAggregate} above).
+   * {@code limit} caps the rows each range sends (-1: none).
+   */
+  record RemoteScan(
+      TableDesc table,
+      String alias,
+      List<Scalar> prefix,
+      Bound low,
+      Bound high,
+      Scalar filter,
+      boolean[] keep,
+      List<Scalar> groups,
+      List<Scalar.AggCall> aggs,
+      long limit,
+      List<Col> columns)
+      implements Plan {
+
+    public boolean aggregating() {
+      return !groups.isEmpty() || !aggs.isEmpty();
+    }
+  }
+
+  /**
+   * The final aggregation over the ranges' partial states: rows of {@code groupCount} group values,
+   * then the aggregates, like an {@link Aggregate}'s.
+   */
+  record MergeAggregate(Plan input, int groupCount, List<Scalar.AggCall> aggs, List<Col> columns)
+      implements Plan {}
+
   // -----------------------------------------------------------------------------------------------
   // Physical joins
 

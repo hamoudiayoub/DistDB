@@ -1,0 +1,236 @@
+# Phase 9: plans chosen by cost, with work pushed to the ranges, answer as PostgreSQL does. Joins of
+# three or more tables are reordered (dynamic programming over ANALYZE's statistics); filters,
+# partial aggregates and limits run on the ranges.
+
+statement ok
+CREATE TABLE digit (d INT PRIMARY KEY)
+
+statement ok
+INSERT INTO digit VALUES (0), (1), (2), (3), (4), (5), (6), (7), (8), (9)
+
+statement ok
+CREATE TABLE region (id INT PRIMARY KEY, name TEXT UNIQUE)
+
+statement ok
+INSERT INTO region VALUES (1, 'north'), (2, 'south'), (3, 'east'), (4, 'west')
+
+statement ok
+CREATE TABLE store (id INT PRIMARY KEY, region_id INT, city TEXT)
+
+statement ok
+INSERT INTO store SELECT d, 1 + d % 4, 'city' || CAST(d AS TEXT) FROM digit
+
+statement ok
+CREATE TABLE product (id INT PRIMARY KEY, name TEXT, price NUMERIC(8,2), category TEXT)
+
+statement ok
+INSERT INTO product SELECT a.d * 10 + b.d, 'p' || CAST(a.d * 10 + b.d AS TEXT), (a.d * 10 + b.d) * 1.25 + 0.5, CASE WHEN b.d < 3 THEN 'food' WHEN b.d < 7 THEN 'tools' ELSE 'toys' END FROM digit a, digit b
+
+statement ok
+CREATE TABLE sale (id INT PRIMARY KEY, store_id INT, product_id INT, qty INT, note TEXT)
+
+statement ok
+INSERT INTO sale SELECT a.d * 100 + b.d * 10 + c.d, (a.d * 7 + b.d * 3 + c.d) % 10, (a.d * 31 + b.d * 17 + c.d * 7) % 100, 1 + (a.d + b.d + c.d) % 5, CASE WHEN c.d = 0 THEN NULL ELSE 'n' || CAST(c.d AS TEXT) END FROM digit a, digit b, digit c
+
+statement ok
+CREATE INDEX sale_store ON sale (store_id)
+
+statement ok
+ANALYZE
+
+query TTI rowsort
+SELECT r.name, p.category, sum(s.qty) FROM sale s JOIN store st ON s.store_id = st.id JOIN region r ON st.region_id = r.id JOIN product p ON s.product_id = p.id GROUP BY r.name, p.category
+----
+east food 240
+east tools 240
+east toys 120
+north food 360
+north tools 360
+north toys 180
+south food 180
+south tools 360
+south toys 360
+west food 120
+west tools 240
+west toys 240
+
+query IT rowsort
+SELECT s.id, p.name FROM region r, store st, sale s, product p WHERE st.region_id = r.id AND s.store_id = st.id AND s.product_id = p.id AND r.name = 'east' AND p.price > 100 AND s.qty = 5
+----
+130 p82
+167 p82
+257 p96
+329 p90
+491 p84
+734 p96
+806 p90
+95 p88
+
+query ITIITIIIIT rowsort
+SELECT * FROM region r JOIN store st ON st.region_id = r.id JOIN sale s ON s.store_id = st.id WHERE s.id < 15
+----
+1 north 0 1 city0 0 0 0 1 NULL
+1 north 4 1 city4 11 4 24 3 n1
+1 north 4 1 city4 4 4 28 5 n4
+1 north 8 1 city8 8 8 56 4 n8
+2 south 1 2 city1 1 1 7 2 n1
+2 south 5 2 city5 12 5 31 4 n2
+2 south 5 2 city5 5 5 35 1 n5
+2 south 9 2 city9 9 9 63 5 n9
+3 east 2 3 city2 2 2 14 3 n2
+3 east 6 3 city6 13 6 38 5 n3
+3 east 6 3 city6 6 6 42 2 n6
+4 west 3 4 city3 10 3 17 2 NULL
+4 west 3 4 city3 3 3 21 4 n3
+4 west 7 4 city7 14 7 45 1 n4
+4 west 7 4 city7 7 7 49 3 n7
+
+query III rowsort
+SELECT a.id, b.id, count(*) FROM store a JOIN store b ON a.region_id = b.region_id AND a.id < b.id JOIN sale s ON s.store_id = a.id JOIN product p ON p.id = s.product_id JOIN region r ON r.id = b.region_id WHERE p.category = 'toys' GROUP BY a.id, b.id
+----
+0 4 20
+0 8 20
+1 5 40
+1 9 40
+2 6 20
+3 7 40
+4 8 20
+5 9 40
+
+query TI rowsort
+SELECT r.name, count(st.id) FROM region r LEFT JOIN store st ON st.region_id = r.id AND st.id > 7 GROUP BY r.name
+----
+east 0
+north 1
+south 1
+west 0
+
+query TII rowsort
+SELECT r.name, count(*), sum(s.qty) FROM region r JOIN store st ON st.region_id = r.id LEFT JOIN sale s ON s.store_id = st.id AND s.qty > 4 JOIN digit d ON d.d = st.id GROUP BY r.name
+----
+east 40 200
+north 60 300
+south 60 300
+west 40 200
+
+query TI rowsort
+SELECT p.name, s.qty FROM product p JOIN sale s ON s.product_id = p.id WHERE p.name IN ('p17', 'p21', 'p42') AND s.store_id = 3
+----
+p17 2
+p17 3
+p17 4
+p17 5
+p21 1
+p21 4
+p21 5
+
+query IITT nosort
+SELECT count(*), count(note), min(note), max(note) FROM sale
+----
+1000 900 n1 n9
+
+query T nosort
+SELECT avg(qty) FROM sale
+----
+3.0000000000000000
+
+query T nosort
+SELECT avg(price) FROM product WHERE category = 'tools'
+----
+62.3750000000000000
+
+query IIT rowsort
+SELECT store_id, sum(qty), avg(qty) FROM sale WHERE note IS NOT NULL GROUP BY store_id
+----
+0 270 3.0000000000000000
+1 270 3.0000000000000000
+2 270 3.0000000000000000
+3 270 3.0000000000000000
+4 270 3.0000000000000000
+5 270 3.0000000000000000
+6 270 3.0000000000000000
+7 270 3.0000000000000000
+8 270 3.0000000000000000
+9 270 3.0000000000000000
+
+query II nosort
+SELECT count(DISTINCT product_id), count(DISTINCT store_id) FROM sale
+----
+100 10
+
+query II rowsort
+SELECT qty % 2, count(*) FROM sale GROUP BY qty % 2 HAVING count(*) > 10
+----
+0 400
+1 600
+
+query IIT nosort
+SELECT count(*), sum(qty), avg(qty) FROM sale WHERE id < 0
+----
+0 NULL NULL
+
+query II nosort
+SELECT id, qty FROM sale ORDER BY id LIMIT 5 OFFSET 990
+----
+990 4
+991 5
+992 1
+993 2
+994 3
+
+query II nosort
+SELECT id, qty FROM sale WHERE qty = 3 ORDER BY id LIMIT 3 OFFSET 2
+----
+11 3
+16 3
+20 3
+
+query I rowsort
+SELECT st.id FROM store st WHERE EXISTS (SELECT 1 FROM sale s WHERE s.store_id = st.id AND s.qty = 5 AND s.product_id < st.id * 3)
+----
+2
+3
+4
+5
+6
+7
+8
+9
+
+query I nosort
+SELECT count(*) FROM sale WHERE qty > (SELECT avg(qty) FROM sale)
+----
+400
+
+query IT rowsort
+SELECT id, note FROM sale WHERE id BETWEEN 400 AND 420 AND note LIKE '%3'
+----
+403 n3
+413 n3
+
+statement ok
+BEGIN
+
+statement ok
+UPDATE sale SET qty = qty + 100 WHERE store_id = 2
+
+statement ok
+DELETE FROM sale WHERE store_id = 2 AND id > 900
+
+query II nosort
+SELECT count(*), sum(qty) FROM sale WHERE store_id = 2
+----
+90 9270
+
+query II nosort
+SELECT count(*), max(qty) FROM sale
+----
+990 105
+
+statement ok
+ROLLBACK
+
+query II nosort
+SELECT count(*), sum(qty) FROM sale WHERE store_id = 2
+----
+100 300
