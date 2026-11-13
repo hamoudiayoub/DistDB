@@ -59,8 +59,21 @@ public final class RaftNode {
       Map<NodeId, Long> match,
       NodeId transferee) {}
 
+  /**
+   * What this node has done since it started, for metrics. The counts only grow; read from another
+   * thread they may lag a little.
+   */
+  public record Counters(
+      long proposals, long elections, long leaderships, long appendsSent, long entriesSent) {}
+
   private static final Comparator<NodeId> BY_VALUE = Comparator.comparingInt(NodeId::value);
   private static final int MAX_APPLY_BATCH = 1024;
+
+  private long proposals;
+  private long elections;
+  private long leaderships;
+  private long appendsSent;
+  private long entriesSent;
 
   private final RaftConfig cfg;
   private final NodeId id;
@@ -275,7 +288,12 @@ public final class RaftNode {
       return false; // during a transfer, so that the target can catch up
     }
     appendAsLeader(Entry.Type.NORMAL, command.clone());
+    proposals++;
     return true;
+  }
+
+  public Counters counters() {
+    return new Counters(proposals, elections, leaderships, appendsSent, entriesSent);
   }
 
   /**
@@ -507,6 +525,7 @@ public final class RaftNode {
       term++;
       vote = id;
       role = Role.CANDIDATE;
+      elections++;
     }
     leader = null;
     resetElectionTimer();
@@ -603,6 +622,7 @@ public final class RaftNode {
   }
 
   private void becomeLeader() {
+    leaderships++;
     role = Role.LEADER;
     leader = id;
     transferee = null;
@@ -834,6 +854,8 @@ public final class RaftNode {
       return false;
     }
     send(new Message.AppendEntries(id, to, term, prevIndex, prevTerm, entries, log.committed()));
+    appendsSent++;
+    entriesSent += entries.size();
     if (pr.state == Progress.State.REPLICATE) {
       if (!entries.isEmpty()) {
         long last = entries.getLast().index();

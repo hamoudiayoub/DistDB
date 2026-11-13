@@ -70,6 +70,8 @@ final class ArchitectureRules {
           .definedBy("io.distdb.sql..")
           .layer("pgwire")
           .definedBy("io.distdb.pgwire..")
+          .layer("shell")
+          .definedBy("io.distdb.shell..")
           .layer("server")
           .definedBy("io.distdb.server..")
           .layer("sim")
@@ -98,8 +100,11 @@ final class ArchitectureRules {
           .mayOnlyAccessLayers("txn", "client", "rpc", "env", "common")
           .whereLayer("pgwire")
           .mayOnlyAccessLayers("sql", "env", "common")
+          .whereLayer("shell")
+          .mayNotAccessAnyLayer()
           .whereLayer("sim")
-          .mayNotBeAccessedByAnyLayer()
+          // The chaos suite (bench) checks real histories with the simulator's checker.
+          .mayOnlyBeAccessedByLayers("bench")
           .whereLayer("bench")
           .mayNotBeAccessedByAnyLayer();
 

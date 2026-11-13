@@ -276,6 +276,18 @@ public final class PlacementDriver implements KvHandler, AutoCloseable {
         Operator op = schedule(report, store);
         if (op != null) {
           out.addOperators(op);
+          operatorsIssued.increment();
+          io.distdb.common.Log.info(
+              LOG,
+              "operator issued",
+              "pd",
+              config.self().value(),
+              "range",
+              op.getRangeId(),
+              "kind",
+              op.getKindCase().name().toLowerCase(java.util.Locale.ROOT),
+              "to_store",
+              store.value());
         }
       }
     }
@@ -348,7 +360,10 @@ public final class PlacementDriver implements KvHandler, AutoCloseable {
   private ListRangesResponse list() {
     ListRangesResponse.Builder out = ListRangesResponse.newBuilder();
     ranges.values().forEach(st -> out.addRanges(info(st)));
-    stores.forEach((id, st) -> out.putStores(id.value(), st.address()));
+    stores.forEach((id, st) -> {
+      out.putStores(id.value(), st.address());
+      out.putAlive(id.value(), alive(id));
+    });
     return out.build();
   }
 
@@ -591,10 +606,40 @@ public final class PlacementDriver implements KvHandler, AutoCloseable {
    * smaller than one the new leader already issued: a transaction that begins after another
    * committed always gets a start above that commit.
    */
+  private static final System.Logger LOG = System.getLogger(PlacementDriver.class.getName());
+
+  private final java.util.concurrent.atomic.LongAdder operatorsIssued =
+      new java.util.concurrent.atomic.LongAdder();
+  private final java.util.concurrent.atomic.LongAdder tsoRequests =
+      new java.util.concurrent.atomic.LongAdder();
+  private final java.util.concurrent.atomic.LongAdder tsoTimestamps =
+      new java.util.concurrent.atomic.LongAdder();
+
+  /** What this PD node has done, for metrics; the gauges describe what it knows now. */
+  public record ServiceStats(
+      boolean leader,
+      long ranges,
+      long stores,
+      long operatorsIssued,
+      long tsoRequests,
+      long tsoTimestamps) {}
+
+  public synchronized ServiceStats serviceStats() {
+    return new ServiceStats(
+        isLeader(),
+        ranges.size(),
+        stores.size(),
+        operatorsIssued.sum(),
+        tsoRequests.sum(),
+        tsoTimestamps.sum());
+  }
+
   private CompletableFuture<KvResponse> tso(int count) {
     if (!isLeader()) {
       return CompletableFuture.completedFuture(notLeader());
     }
+    tsoRequests.increment();
+    tsoTimestamps.add(Math.max(0, count));
     if (count < 1 || count > 1 << 16) {
       return CompletableFuture.completedFuture(
           KvErrors.invalidArgument("can't hand out " + count + " timestamps at once"));

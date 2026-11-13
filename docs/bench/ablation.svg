@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 326" width="720" height="326" role="img" aria-label="What each optimization buys, on 3 data nodes"><style>
+  .surface { fill: #fcfcfb; } .t1 { fill: #0b0b0b; } .t2 { fill: #52514e; } .t3 { fill: #75746f; }
+  .grid { stroke: #e7e6e2; stroke-width: 1; } .axis { stroke: #c9c8c2; stroke-width: 1; }
+  .s1 { fill: #2a78d6; } .s2 { fill: #eb6834; } .s3 { fill: #1baf7a; }
+  .l1 { stroke: #2a78d6; } .l2 { stroke: #eb6834; } .l3 { stroke: #1baf7a; }
+  .mark { stroke: #52514e; }
+  text { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  .num { font-variant-numeric: tabular-nums; }
+  @media (prefers-color-scheme: dark) {
+    .surface { fill: #1a1a19; } .t1 { fill: #f0efec; } .t2 { fill: #c3c2b7; } .t3 { fill: #9a998f; }
+    .grid { stroke: #2c2c2a; } .axis { stroke: #44443f; }
+    .s1 { fill: #3987e5; } .s2 { fill: #d95926; } .s3 { fill: #199e70; }
+    .l1 { stroke: #3987e5; } .l2 { stroke: #d95926; } .l3 { stroke: #199e70; }
+    .mark { stroke: #c3c2b7; }
+  }
+</style>
+<rect class="surface" width="720" height="326" rx="12"/><text class="t1" x="24" y="34" font-size="16" font-weight="600">What each optimization buys, on 3 data nodes</text><text class="t2" x="24" y="54" font-size="12">Speed with it on ÷ speed with it off: SQL updates/s (TSO), aggregation latency (pushdown), KV writes/s (the rest)</text><text class="t2" x="200.0" y="103.0" font-size="12" text-anchor="end">TSO batching</text><path class="s1" d="M210.0 90.0 H646.0 A4.0 4.0 0 0 1 650.0 94.0 V106.0 A4.0 4.0 0 0 1 646.0 110.0 H210.0 Z"><title>TSO batching: 10.3×</title></path><text class="t1 num" x="658.0" y="104.0" font-size="12" font-weight="600">10.3×</text><text class="t2" x="200.0" y="143.0" font-size="12" text-anchor="end">Coprocessor pushdown</text><path class="s1" d="M210.0 130.0 H283.5 A4.0 4.0 0 0 1 287.5 134.0 V146.0 A4.0 4.0 0 0 1 283.5 150.0 H210.0 Z"><title>Coprocessor pushdown: 1.82×</title></path><text class="t1 num" x="295.5" y="144.0" font-size="12" font-weight="600">1.82×</text><text class="t2" x="200.0" y="183.0" font-size="12" text-anchor="end">WAL group commit</text><path class="s1" d="M210.0 170.0 H259.2 A4.0 4.0 0 0 1 263.2 174.0 V186.0 A4.0 4.0 0 0 1 259.2 190.0 H210.0 Z"><title>WAL group commit: 1.25×</title></path><text class="t1 num" x="271.2" y="184.0" font-size="12" font-weight="600">1.25×</text><text class="t2" x="200.0" y="223.0" font-size="12" text-anchor="end">Raft pipelining</text><path class="s1" d="M210.0 210.0 H254.6 A4.0 4.0 0 0 1 258.6 214.0 V226.0 A4.0 4.0 0 0 1 254.6 230.0 H210.0 Z"><title>Raft pipelining: 1.14×</title></path><text class="t1 num" x="266.6" y="224.0" font-size="12" font-weight="600">1.14×</text><text class="t2" x="200.0" y="263.0" font-size="12" text-anchor="end">Raft batching</text><path class="s1" d="M210.0 250.0 H247.7 A4.0 4.0 0 0 1 251.7 254.0 V266.0 A4.0 4.0 0 0 1 247.7 270.0 H210.0 Z"><title>Raft batching: 0.98×</title></path><text class="t1 num" x="259.7" y="264.0" font-size="12" font-weight="600">0.98×</text><line class="axis" x1="210.0" x2="210.0" y1="80.0" y2="280.0"/><text class="t3" x="24" y="312" font-size="11">one machine · Intel Core i5-13420H (8 cores, 12 threads), 7.7 GB RAM, Micron 512 GB NVMe SSD, Windows 11, Java 25</text></svg>

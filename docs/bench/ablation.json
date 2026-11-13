@@ -1,0 +1,100 @@
+{
+  "suite": "ablation",
+  "when": "2026-11-13T07:19:51.094469100Z",
+  "hardware": "Intel Core i5-13420H (8 cores, 12 threads), 7.7 GB RAM, Micron 512 GB NVMe SSD, Windows 11, Java 25",
+  "quick": false,
+  "kv_writes_64_clients": {
+    "all on": {
+      "ops": 4105,
+      "errors": 0,
+      "seconds": 12,
+      "throughput_per_s": 342.1,
+      "p50_ms": 146.3,
+      "p99_ms": 702.6,
+      "p999_ms": 945.8,
+      "max_ms": 1016
+    },
+    "raft.batch=off": {
+      "ops": 4184,
+      "errors": 0,
+      "seconds": 12,
+      "throughput_per_s": 348.7,
+      "p50_ms": 127.1,
+      "p99_ms": 664.8,
+      "p999_ms": 752.9,
+      "max_ms": 764.4
+    },
+    "raft.pipeline=off": {
+      "ops": 3601,
+      "errors": 0,
+      "seconds": 12,
+      "throughput_per_s": 300.1,
+      "p50_ms": 191.4,
+      "p99_ms": 824.2,
+      "p999_ms": 1212,
+      "max_ms": 1271
+    },
+    "wal.group-commit=off": {
+      "ops": 3288,
+      "errors": 0,
+      "seconds": 12,
+      "throughput_per_s": 274,
+      "p50_ms": 212.3,
+      "p99_ms": 669.0,
+      "p999_ms": 757.1,
+      "max_ms": 1008
+    }
+  },
+  "sql_point_updates_32_connections": {
+    "all on": {
+      "ops": 806,
+      "errors": 0,
+      "seconds": 12,
+      "throughput_per_s": 67.17,
+      "p50_ms": 342.9,
+      "p99_ms": 1447,
+      "p999_ms": 2525,
+      "max_ms": 2529
+    },
+    "tso.batch=off": {
+      "ops": 78,
+      "errors": 0,
+      "seconds": 12,
+      "throughput_per_s": 6.500,
+      "p50_ms": 1229,
+      "p99_ms": 1.017e+04,
+      "p999_ms": 1.017e+04,
+      "max_ms": 1.019e+04
+    }
+  },
+  "pushdown": [
+    {
+      "query": "count(*)",
+      "ms_off": 1466,
+      "ms_on": 931.7,
+      "gateway_bytes_off": 2.990e+06,
+      "gateway_bytes_on": 573.6
+    },
+    {
+      "query": "group by region",
+      "ms_off": 1546,
+      "ms_on": 690.1,
+      "gateway_bytes_off": 2.990e+06,
+      "gateway_bytes_on": 4859
+    },
+    {
+      "query": "filter + group by",
+      "ms_off": 1427,
+      "ms_on": 819.6,
+      "gateway_bytes_off": 2.990e+06,
+      "gateway_bytes_on": 2.382e+04
+    }
+  ],
+  "gain": {
+    "group_commit": 1.250,
+    "pushdown": 1.820,
+    "raft_pipelining": 1.140,
+    "tso_batching": 10.33,
+    "raft_batching": 0.9800
+  }
+}

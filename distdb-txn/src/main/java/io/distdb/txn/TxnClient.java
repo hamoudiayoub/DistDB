@@ -54,12 +54,23 @@ public final class TxnClient {
    * @param lockTtl how long a lock protects an unfinished transaction from readers
    * @param timeout the deadline for each request (a read, a prewrite, a commit)
    * @param crash where to stop on purpose, for tests ({@code t -> NONE} otherwise)
+   * @param batchTimestamps whether concurrent callers share one oracle request (see {@link Tso});
+   *     off, each timestamp costs its own round trip (for before/after benchmarks)
    */
-  public record Options(Duration lockTtl, Duration timeout, Crash crash) {
+  public record Options(Duration lockTtl, Duration timeout, Crash crash, boolean batchTimestamps) {
     public Options {
       Objects.requireNonNull(lockTtl);
       Objects.requireNonNull(timeout);
       Objects.requireNonNull(crash);
+    }
+
+    /** Options with timestamp batching on. */
+    public Options(Duration lockTtl, Duration timeout, Crash crash) {
+      this(lockTtl, timeout, crash, true);
+    }
+
+    public Options withBatchTimestamps(boolean on) {
+      return new Options(lockTtl, timeout, crash, on);
     }
 
     /** Locks live 3 s, requests wait up to 10 s, nobody crashes. */
@@ -68,7 +79,49 @@ public final class TxnClient {
     }
   }
 
+  private static final System.Logger LOG = System.getLogger(TxnClient.class.getName());
+
   private final KvClient kv;
+  private final PdClient pd;
+
+  private final java.util.concurrent.atomic.LongAdder begun =
+      new java.util.concurrent.atomic.LongAdder();
+  private final java.util.concurrent.atomic.LongAdder committed =
+      new java.util.concurrent.atomic.LongAdder();
+  private final java.util.concurrent.atomic.LongAdder conflicts =
+      new java.util.concurrent.atomic.LongAdder();
+  private final java.util.concurrent.atomic.LongAdder unknown =
+      new java.util.concurrent.atomic.LongAdder();
+  private final java.util.concurrent.atomic.LongAdder resolutions =
+      new java.util.concurrent.atomic.LongAdder();
+
+  /** What this client's transactions came to, for metrics. */
+  public record Stats(
+      long begun, long committed, long conflicts, long unknownOutcomes, long lockResolutions) {}
+
+  public Stats stats() {
+    return new Stats(
+        begun.sum(), committed.sum(), conflicts.sum(), unknown.sum(), resolutions.sum());
+  }
+
+  /** Counts how a commit ended (called by {@link Txn#commit}). */
+  void counted(Throwable failure) {
+    if (failure == null) {
+      committed.increment();
+      return;
+    }
+    Throwable t = unwrap(failure);
+    if (t instanceof TxnException e) {
+      switch (e.code()) {
+        case CONFLICT, ABORTED -> conflicts.increment();
+        case UNKNOWN -> unknown.increment();
+        default -> {
+          // a timeout or a failure before anything was written
+        }
+      }
+    }
+  }
+
   private final Tso tso;
   private final Clock clock;
   private final Scheduler scheduler;
@@ -88,21 +141,33 @@ public final class TxnClient {
       RandomSource random,
       Options options) {
     this.kv = Objects.requireNonNull(kv);
+    this.pd = Objects.requireNonNull(pd);
     this.clock = Objects.requireNonNull(clock);
     this.scheduler = Objects.requireNonNull(scheduler);
     this.random = Objects.requireNonNull(random);
     this.options = Objects.requireNonNull(options);
-    this.tso = new Tso(pd, clock, scheduler, options.timeout());
+    this.tso = new Tso(pd, clock, scheduler, options.timeout(), options.batchTimestamps());
   }
 
   /** Starts a transaction: it will see every transaction that committed before this call. */
   public CompletableFuture<Txn> begin() {
+    begun.increment();
     return tso.next().thenApply(ts -> new Txn(this, ts));
   }
 
   /** A fresh timestamp from the oracle. */
   public CompletableFuture<Long> timestamp() {
     return tso.next();
+  }
+
+  /** The placement driver's view of the cluster: every range, its leader, and every store. */
+  public CompletableFuture<io.distdb.rpc.proto.ListRangesResponse> listRanges() {
+    return pd.call(
+            io.distdb.rpc.proto.PdRequest.newBuilder()
+                .setListRanges(io.distdb.rpc.proto.ListRangesRequest.getDefaultInstance())
+                .build(),
+            options.timeout())
+        .thenApply(io.distdb.rpc.proto.PdResponse::getListRanges);
   }
 
   /**
@@ -146,6 +211,9 @@ public final class TxnClient {
    * @return whether the lock is gone
    */
   CompletableFuture<Boolean> resolve(LockInfo lock) {
+    resolutions.increment();
+    io.distdb.common.Log.debug(
+        LOG, "resolving lock", "txn", lock.getStartTs(), "primary_len", lock.getPrimary().size());
     return timestamp()
         .thenCompose(now ->
             send(

@@ -21,6 +21,7 @@ include(
   "distdb-txn",
   "distdb-sql",
   "distdb-pgwire",
+  "distdb-shell",
   "distdb-server",
   "distdb-sim",
   "distdb-bench",

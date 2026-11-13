@@ -82,6 +82,36 @@ class SessionTest {
   }
 
   @Test
+  void showDescribesTablesColumnsIndexesAndStatistics() {
+    s.execute("CREATE INDEX acct_owner ON acct (owner)");
+    assertThat(rows(s, "SHOW TABLES"))
+        .containsExactly(
+            java.util.Arrays.asList("acct", 4L, 2L, null, 1L),
+            java.util.Arrays.asList("branch", 2L, 2L, null, 1L));
+    assertThat(rows(s, "SHOW COLUMNS FROM acct"))
+        .containsExactly(
+            java.util.Arrays.asList("id", "bigint", false, null, true),
+            java.util.Arrays.asList("owner", "text", true, null, false),
+            java.util.Arrays.asList("branch", "bigint", true, null, false),
+            java.util.Arrays.asList("balance", "bigint", true, null, false));
+    assertThat(rows(s, "SHOW INDEXES FROM branch"))
+        .containsExactly(
+            List.of("branch_pkey", "id", true, true, "public"),
+            List.of("branch_name_key", "name", true, false, "public"));
+    Result none = s.executeOne("SHOW STATISTICS FOR acct");
+    assertThat(none.rows()).isEmpty();
+    assertThat(none.notices()).anyMatch(n -> n.contains("run ANALYZE acct"));
+    s.execute("ANALYZE acct");
+    List<List<Object>> stats = rows(s, "SHOW STATISTICS FOR acct");
+    assertThat(stats).hasSize(4);
+    assertThat(stats.getFirst()).containsExactly("id", 3L, 3L, 0.0, "1", "3", 2L);
+    assertThat(rows(s, "SHOW TABLES").getFirst().get(3)).isEqualTo(3L);
+    // Not a cluster: no ranges or nodes to show, and a notice says why.
+    assertThat(s.executeOne("SHOW RANGES").notices()).isNotEmpty();
+    assertThat(s.executeOne("SHOW NODES").rows()).isEmpty();
+  }
+
+  @Test
   void aSecondaryIndexIsUsedWhenItIsPublicAndSelective() {
     bigTable(2000);
     s.execute("ANALYZE big");

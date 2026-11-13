@@ -14,6 +14,37 @@ public final class Engine {
   private final KvStore store;
   private final Catalog catalog = new Catalog();
   private final io.distdb.env.Clock clock;
+  private final java.util.concurrent.atomic.LongAdder statements =
+      new java.util.concurrent.atomic.LongAdder();
+  private final java.util.concurrent.atomic.LongAdder failures =
+      new java.util.concurrent.atomic.LongAdder();
+  private final java.util.concurrent.atomic.LongAdder retries =
+      new java.util.concurrent.atomic.LongAdder();
+  private final io.distdb.common.metrics.LatencyHistogram latency =
+      new io.distdb.common.metrics.LatencyHistogram();
+
+  /** What this node's SQL sessions did, for metrics. */
+  public record Stats(
+      long statements,
+      long failures,
+      long autocommitRetries,
+      io.distdb.common.metrics.LatencyHistogram.Snapshot latency) {}
+
+  public Stats stats() {
+    return new Stats(statements.sum(), failures.sum(), retries.sum(), latency.snapshot());
+  }
+
+  void counted(boolean ok, long nanos) {
+    statements.increment();
+    if (!ok) {
+      failures.increment();
+    }
+    latency.record(nanos);
+  }
+
+  void retried() {
+    retries.increment();
+  }
 
   public Engine(KvStore store) {
     this(store, io.distdb.env.SystemClock.INSTANCE);

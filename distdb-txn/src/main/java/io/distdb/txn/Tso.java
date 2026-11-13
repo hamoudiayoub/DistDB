@@ -22,21 +22,27 @@ final class Tso {
   private final Clock clock;
   private final Scheduler scheduler;
   private final Duration timeout;
+  private final boolean batch;
   private final List<Waiter> waiting = new ArrayList<>(); // guarded by this
   private boolean inFlight; // guarded by this
 
   private record Waiter(CompletableFuture<Long> future, long deadline) {}
 
-  Tso(PdClient pd, Clock clock, Scheduler scheduler, Duration timeout) {
+  Tso(PdClient pd, Clock clock, Scheduler scheduler, Duration timeout, boolean batch) {
     this.pd = Objects.requireNonNull(pd);
     this.clock = Objects.requireNonNull(clock);
     this.scheduler = Objects.requireNonNull(scheduler);
     this.timeout = Objects.requireNonNull(timeout);
+    this.batch = batch;
   }
 
   /** The next timestamp: above every timestamp issued before this call. */
   CompletableFuture<Long> next() {
     CompletableFuture<Long> f = new CompletableFuture<>();
+    if (!batch) {
+      single(f, clock.nanoTime() + timeout.toNanos());
+      return f;
+    }
     synchronized (this) {
       waiting.add(new Waiter(f, clock.nanoTime() + timeout.toNanos()));
       if (inFlight) {
@@ -82,6 +88,24 @@ final class Tso {
             next(batch, Duration.ZERO);
           } else {
             next(batch, Duration.ofMillis(20)); // no leader, or busy: ask again shortly
+          }
+        });
+  }
+
+  /** Without batching: one request for one timestamp, retried until the deadline. */
+  private void single(CompletableFuture<Long> f, long deadline) {
+    if (clock.nanoTime() >= deadline) {
+      f.completeExceptionally(
+          new TxnException(TxnException.Code.FAILED, "no timestamp in time", null));
+      return;
+    }
+    PdRequest request = PdRequest.newBuilder().setTso(TsoRequest.newBuilder().setCount(1)).build();
+    pd.call(request, Duration.ofMillis(500))
+        .whenComplete((response, failure) -> {
+          if (response != null && response.hasTso() && response.getTso().getCount() >= 1) {
+            f.complete(response.getTso().getFirst());
+          } else {
+            scheduler.schedule(Duration.ofMillis(20), () -> single(f, deadline));
           }
         });
   }

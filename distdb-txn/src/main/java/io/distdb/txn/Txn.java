@@ -235,8 +235,13 @@ public final class Txn {
     checkOpen();
     finished = true;
     if (writes.isEmpty()) {
+      client.counted(null);
       return CompletableFuture.completedFuture(startTs);
     }
+    return commitWrites().whenComplete((ts, failure) -> client.counted(failure));
+  }
+
+  private CompletableFuture<Long> commitWrites() {
     TxnClient.CrashPoint crash = client.options().crash().at(this);
     ByteString primary = writes.firstEntry().getValue().getKey();
     long deadline = deadline();

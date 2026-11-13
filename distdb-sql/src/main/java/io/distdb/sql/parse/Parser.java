@@ -343,6 +343,33 @@ public final class Parser {
 
   private Statement show() {
     expect("show");
+    if (accept("tables")) {
+      return new Ast.ShowCatalog(Ast.ShowCatalog.What.TABLES, null);
+    }
+    if (accept("nodes")) {
+      return new Ast.ShowCatalog(Ast.ShowCatalog.What.NODES, null);
+    }
+    if (accept("columns")) {
+      expect("from");
+      return new Ast.ShowCatalog(Ast.ShowCatalog.What.COLUMNS, identifier());
+    }
+    if (accept("indexes") || accept("index")) {
+      expect("from");
+      return new Ast.ShowCatalog(Ast.ShowCatalog.What.INDEXES, identifier());
+    }
+    if (accept("statistics")) {
+      expect("for");
+      accept("table");
+      return new Ast.ShowCatalog(Ast.ShowCatalog.What.STATISTICS, identifier());
+    }
+    if (accept("ranges")) {
+      String table = null;
+      if (accept("from")) {
+        expect("table");
+        table = identifier();
+      }
+      return new Ast.ShowCatalog(Ast.ShowCatalog.What.RANGES, table);
+    }
     if (accept("transaction")) {
       expect("isolation");
       expect("level");

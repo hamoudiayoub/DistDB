@@ -25,13 +25,26 @@ public final class Main {
             Run node N of the placement driver; it listens on its own entry in --peers.
 
         distdb node --data-dir DIR --id N --listen HOST:PORT --pd PD_ADDRESSES [--founders 1,2,3]
-                    [--sql HOST:PORT]
+                    [--sql HOST:PORT] [--http HOST:PORT] [--tune SPEC] [--chaos on]
             Run data node N. The founders create the first range when the cluster is new;
             the placement driver then splits ranges and spreads them over all data nodes.
             With --sql, the node also serves SQL to PostgreSQL clients (psql, JDBC) there.
 
+      Every pd and node also takes:
+        --http HOST:PORT   /metrics (Prometheus), /debug (a page for people), /health
+        --tune SPEC        turn optimizations off, for benchmarks: raft.batch=off,
+                           raft.pipeline=off, tso.batch=off, wal.group-commit=off
+        --chaos on         let /debug/clock?offset_ms=N skew this node's clock (chaos tests)
+      Logs go to stderr as key=value events; DISTDB_LOG=debug|info|warn|error sets the level.
+
         distdb ranges --pd PD_ADDRESSES
             Print every range: its span, epoch, replicas and leader.
+
+        distdb sql [HOST:PORT] [-c SQL]... [-f FILE]
+            The SQL shell, connected to a node's --sql port (default 127.0.0.1:5433).
+
+        distdb demo [--nodes N] [-c SQL]...
+            A whole cluster in this process (3 PD nodes, N data nodes, default 3), and the shell.
 
         distdb kv [--server HOST:PORT[,HOST:PORT...] | --pd PD_ADDRESSES] [--timeout DURATION] OPERATION
             get KEY                         print the value (exit 1 if there is none)
@@ -67,6 +80,8 @@ public final class Main {
         case "kv" -> KvCommand.run(rest, out, err);
         case "pd" -> ShardedCommands.pd(rest, out, err);
         case "ranges" -> ShardedCommands.ranges(rest, out, err);
+        case "sql" -> io.distdb.shell.Shell.run(rest, System.in, out, err);
+        case "demo" -> DemoCommand.run(rest, out, err);
         default -> throw new Args.UsageException("unknown command " + args.getFirst());
       };
     } catch (Args.UsageException | IllegalArgumentException e) {

@@ -13,6 +13,8 @@ package io.distdb.storage.lsm;
  * @param levelBaseBytes maximum size of level 1; each deeper level may be {@code levelMultiplier}
  *     times larger
  * @param levelMultiplier size ratio between adjacent levels
+ * @param groupCommit concurrent writers share one log write and one fsync (see {@link
+ *     LsmEngine#write})
  */
 public record EngineOptions(
     int memtableBytes,
@@ -22,7 +24,30 @@ public record EngineOptions(
     int l0CompactionTrigger,
     int l0StopTrigger,
     long levelBaseBytes,
-    int levelMultiplier) {
+    int levelMultiplier,
+    boolean groupCommit) {
+
+  /** Options with group commit on. */
+  public EngineOptions(
+      int memtableBytes,
+      int blockBytes,
+      int bloomBitsPerKey,
+      long targetFileBytes,
+      int l0CompactionTrigger,
+      int l0StopTrigger,
+      long levelBaseBytes,
+      int levelMultiplier) {
+    this(
+        memtableBytes,
+        blockBytes,
+        bloomBitsPerKey,
+        targetFileBytes,
+        l0CompactionTrigger,
+        l0StopTrigger,
+        levelBaseBytes,
+        levelMultiplier,
+        true);
+  }
 
   public EngineOptions {
     if (memtableBytes <= 0
@@ -42,5 +67,19 @@ public record EngineOptions(
   /** Defaults close to LevelDB's. */
   public static EngineOptions defaults() {
     return new EngineOptions(4 << 20, 4096, 10, 2 << 20, 4, 12, 10L << 20, 10);
+  }
+
+  /** A copy with group commit on or off (off: every synced write pays its own fsync). */
+  public EngineOptions withGroupCommit(boolean on) {
+    return new EngineOptions(
+        memtableBytes,
+        blockBytes,
+        bloomBitsPerKey,
+        targetFileBytes,
+        l0CompactionTrigger,
+        l0StopTrigger,
+        levelBaseBytes,
+        levelMultiplier,
+        on);
   }
 }

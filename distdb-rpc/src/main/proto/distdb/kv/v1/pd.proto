@@ -123,6 +123,8 @@ message ListRangesRequest {}
 message ListRangesResponse {
   repeated RangeInfo ranges = 1;
   map<uint32, string> stores = 2;
+  // Whether the PD heard from each store recently (within its dead-after interval).
+  map<uint32, bool> alive = 3;
 }
 
 // count timestamps, strictly increasing and above any issued before this request arrived.

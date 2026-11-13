@@ -1,0 +1,124 @@
+# A DistDB cluster: three placement-driver nodes and five data nodes.
+#   ./gradlew :distdb-server:installDist && docker compose up -d --build
+#   distdb sql 127.0.0.1:5433        (or: psql -h 127.0.0.1 -p 5433 -U distdb)
+# SQL on n1-n3 (localhost:5433-5435); each node's /debug and /metrics on localhost:8081-8085
+# (data nodes) and 8091-8093 (PD). The chaos suite (distdb-bench chaos) injects faults here.
+# Monitoring: Prometheus on localhost:9090 scrapes every node; Grafana on localhost:3000 opens on
+# the DistDB dashboard (no login; admin/admin to edit).
+
+x-distdb: &distdb
+  image: distdb:latest
+  build: .
+  cap_add: [NET_ADMIN]
+  restart: "no"
+  stop_grace_period: 2s
+
+services:
+  pd1:
+    <<: *distdb
+    container_name: distdb-pd1
+    hostname: pd1
+    environment:
+      JAVA_OPTS: "-Xmx160m -Xss512k -XX:+UseSerialGC -XX:MaxDirectMemorySize=48m"
+    command: pd --data-dir /data --id 1 --peers 1=pd1:7600,2=pd2:7600,3=pd3:7600 --http 0.0.0.0:8080 --chaos on --dead-after 10s --split-keys 4000
+    ports:
+      - "8091:8080"
+  pd2:
+    <<: *distdb
+    container_name: distdb-pd2
+    hostname: pd2
+    environment:
+      JAVA_OPTS: "-Xmx160m -Xss512k -XX:+UseSerialGC -XX:MaxDirectMemorySize=48m"
+    command: pd --data-dir /data --id 2 --peers 1=pd1:7600,2=pd2:7600,3=pd3:7600 --http 0.0.0.0:8080 --chaos on --dead-after 10s --split-keys 4000
+    ports:
+      - "8092:8080"
+  pd3:
+    <<: *distdb
+    container_name: distdb-pd3
+    hostname: pd3
+    environment:
+      JAVA_OPTS: "-Xmx160m -Xss512k -XX:+UseSerialGC -XX:MaxDirectMemorySize=48m"
+    command: pd --data-dir /data --id 3 --peers 1=pd1:7600,2=pd2:7600,3=pd3:7600 --http 0.0.0.0:8080 --chaos on --dead-after 10s --split-keys 4000
+    ports:
+      - "8093:8080"
+  n1:
+    <<: *distdb
+    container_name: distdb-n1
+    hostname: n1
+    environment:
+      JAVA_OPTS: "-Xmx224m -Xss512k -XX:+UseSerialGC -XX:MaxDirectMemorySize=64m"
+    command: node --data-dir /data --id 1 --listen n1:7700 --pd pd1:7600,pd2:7600,pd3:7600 --founders 1,2,3 --sql 0.0.0.0:5433 --http 0.0.0.0:8080 --chaos on
+    depends_on: [pd1, pd2, pd3]
+    ports:
+      - "5433:5433"
+      - "8081:8080"
+  n2:
+    <<: *distdb
+    container_name: distdb-n2
+    hostname: n2
+    environment:
+      JAVA_OPTS: "-Xmx224m -Xss512k -XX:+UseSerialGC -XX:MaxDirectMemorySize=64m"
+    command: node --data-dir /data --id 2 --listen n2:7700 --pd pd1:7600,pd2:7600,pd3:7600 --founders 1,2,3 --sql 0.0.0.0:5433 --http 0.0.0.0:8080 --chaos on
+    depends_on: [pd1, pd2, pd3]
+    ports:
+      - "5434:5433"
+      - "8082:8080"
+  n3:
+    <<: *distdb
+    container_name: distdb-n3
+    hostname: n3
+    environment:
+      JAVA_OPTS: "-Xmx224m -Xss512k -XX:+UseSerialGC -XX:MaxDirectMemorySize=64m"
+    command: node --data-dir /data --id 3 --listen n3:7700 --pd pd1:7600,pd2:7600,pd3:7600 --founders 1,2,3 --sql 0.0.0.0:5433 --http 0.0.0.0:8080 --chaos on
+    depends_on: [pd1, pd2, pd3]
+    ports:
+      - "5435:5433"
+      - "8083:8080"
+  n4:
+    <<: *distdb
+    container_name: distdb-n4
+    hostname: n4
+    environment:
+      JAVA_OPTS: "-Xmx224m -Xss512k -XX:+UseSerialGC -XX:MaxDirectMemorySize=64m"
+    command: node --data-dir /data --id 4 --listen n4:7700 --pd pd1:7600,pd2:7600,pd3:7600 --founders 1,2,3 --http 0.0.0.0:8080 --chaos on
+    depends_on: [pd1, pd2, pd3]
+    ports:
+      - "8084:8080"
+  n5:
+    <<: *distdb
+    container_name: distdb-n5
+    hostname: n5
+    environment:
+      JAVA_OPTS: "-Xmx224m -Xss512k -XX:+UseSerialGC -XX:MaxDirectMemorySize=64m"
+    command: node --data-dir /data --id 5 --listen n5:7700 --pd pd1:7600,pd2:7600,pd3:7600 --founders 1,2,3 --http 0.0.0.0:8080 --chaos on
+    depends_on: [pd1, pd2, pd3]
+    ports:
+      - "8085:8080"
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    container_name: distdb-prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=2d
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+    mem_limit: 256m
+  grafana:
+    image: grafana/grafana:12.1.0
+    container_name: distdb-grafana
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/distdb.json
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_NEWS_NEWS_FEED_ENABLED: "false"
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "3000:3000"
+    depends_on: [prometheus]
+    mem_limit: 256m

@@ -1,0 +1,29 @@
+{
+  "when": "2026-11-13T07:50:34.367967200Z",
+  "seconds_of_faults": 180,
+  "verdict": "pass",
+  "register_history_ops": 2096,
+  "linearizable": true,
+  "counts": {
+    "audits": 203,
+    "register reads": 1035,
+    "register writes": 1052,
+    "register writes unknown": 1,
+    "transfer failures": 453,
+    "transfers": 1111
+  },
+  "faults": [
+    "20.4 s: latency 150ms ± 50ms on [n3, n4]",
+    "38.0 s: kill -9 n4",
+    "51.4 s: clock skew -4234 ms on [pd1, pd3], then kill -9 the PD leader pd2",
+    "73.3 s: clock skew -6596 ms on [pd1, pd2], then kill -9 the PD leader pd3",
+    "93.0 s: partition: n5 cut off from everyone",
+    "120.7 s: pause pd3",
+    "130.8 s: kill -9 n3",
+    "147.1 s: latency 150ms ± 50ms on [n3, pd2]",
+    "168.3 s: clock skew -2592 ms on pd1",
+    "182.9 s: kill -9 n1"
+  ],
+  "violations": [
+  ]
+}

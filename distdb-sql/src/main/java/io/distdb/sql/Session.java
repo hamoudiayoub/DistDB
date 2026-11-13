@@ -185,6 +185,10 @@ public final class Session {
         p.paramTypes = List.of();
         p.columns = List.of(new Result.Column(s.name(), Type.TEXT));
       }
+      case Ast.ShowCatalog c -> {
+        p.paramTypes = List.of();
+        p.columns = ShowCatalog.columns(c.what());
+      }
       case Ast.Explain e -> {
         p.paramTypes = List.of();
         p.columns = List.of(new Result.Column("QUERY PLAN", Type.TEXT));
@@ -242,6 +246,18 @@ public final class Session {
   // Statements
 
   private Result run(Ast.Statement s, Prepared p, Object[] params) {
+    long started = engine.clock().nanoTime();
+    boolean ok = false;
+    try {
+      Result r = runCounted(s, p, params);
+      ok = true;
+      return r;
+    } finally {
+      engine.counted(ok, engine.clock().nanoTime() - started);
+    }
+  }
+
+  private Result runCounted(Ast.Statement s, Prepared p, Object[] params) {
     if (state == TxnState.FAILED && !(s instanceof Ast.Rollback) && !(s instanceof Ast.Commit)) {
       throw new SqlException(
           SqlState.IN_FAILED_SQL_TRANSACTION,
@@ -254,6 +270,8 @@ public final class Session {
         case Ast.Rollback r -> rollback();
         case Ast.SetVar v -> set(v);
         case Ast.ShowVar v -> show(v);
+        case Ast.ShowCatalog c ->
+            inTransaction(t -> ShowCatalog.run(engine.catalog().load(t), engine.store(), c));
         case Ast.CreateTable ct ->
             inTransaction(t -> SchemaChanges.createTable(engine.catalog(), t, ct));
         case Ast.CreateIndex ci -> {
@@ -372,6 +390,7 @@ public final class Session {
         if (!e.retryable() || attempt >= AUTOCOMMIT_ATTEMPTS) {
           throw e;
         }
+        engine.retried();
       } catch (RuntimeException e) {
         rollbackQuietly(t);
         throw e;

@@ -6,7 +6,6 @@ import io.distdb.common.NodeId;
 import io.distdb.env.ExecutorScheduler;
 import io.distdb.env.LocalFileSystem;
 import io.distdb.env.SplittableRandomSource;
-import io.distdb.env.SystemClock;
 import io.distdb.kv.Ranges;
 import io.distdb.kv.ReplicatedKv;
 import io.distdb.kv.Store;
@@ -63,6 +62,12 @@ final class ShardedCommands {
     for (String f : foundersText.isEmpty() ? new String[0] : foundersText.split(",")) {
       founders.add(NodeCommand.nodeId(f.trim()));
     }
+    Tuning tuning = Tuning.parse(args.option("tune", null));
+    boolean chaos = "on".equals(args.option("chaos", "off"));
+    SkewClock clock = new SkewClock();
+    if (System.getProperty("distdb.demo") == null) {
+      LogSetup.install("node-" + self.value());
+    }
     DataDirLock lock = DataDirLock.acquire(dataDir, err);
     if (lock == null) {
       return 3;
@@ -73,7 +78,7 @@ final class ShardedCommands {
             LocalFileSystem.INSTANCE,
             scheduler,
             dataDir.resolve("engine"),
-            EngineOptions.defaults());
+            tuning.engine(EngineOptions.defaults()));
     // Peers' addresses come from the placement driver, through the store.
     AtomicReference<Store> holder = new AtomicReference<>();
     GrpcTransport transport =
@@ -86,11 +91,11 @@ final class ShardedCommands {
     PdClient pd = new PdClient(pdAddresses, GrpcKvChannel::connect);
     Store store =
         new Store(
-            Store.Config.defaults(self, listenText, founders),
+            tuned(Store.Config.defaults(self, listenText, founders), tuning),
             engine,
             transport,
             pd,
-            SystemClock.INSTANCE,
+            clock,
             scheduler,
             SplittableRandomSource.fromEntropy(),
             failure -> halt(err, failure),
@@ -100,21 +105,20 @@ final class ShardedCommands {
     store.coprocessor(new io.distdb.sql.exec.SqlCoprocessor());
     GrpcKvServer server =
         GrpcKvServer.start(
-            new InetSocketAddress(listen.host(), listen.port()),
-            store,
-            SystemClock.INSTANCE,
-            transport.service());
+            new InetSocketAddress(listen.host(), listen.port()), store, clock, transport.service());
     store.start();
     // SQL: a PostgreSQL wire server whose sessions run Phase 7 transactions through this node.
     String sqlText = args.option("sql", null);
     PgServer sql = null;
+    TxnClient sqlTxn = null;
+    Engine sqlEngine = null;
     if (sqlText != null) {
       Args.HostPort sqlAt = Args.hostPort(sqlText);
       KvClient kv =
           new KvClient(
               pd,
               GrpcKvChannel::connect,
-              SystemClock.INSTANCE,
+              clock,
               scheduler,
               SplittableRandomSource.fromEntropy(),
               ClientOptions.defaults());
@@ -122,17 +126,38 @@ final class ShardedCommands {
           new TxnClient(
               kv,
               pd,
-              SystemClock.INSTANCE,
+              clock,
               scheduler,
               SplittableRandomSource.fromEntropy(),
-              TxnClient.Options.defaults());
-      sql =
-          PgServer.start(
-              new InetSocketAddress(sqlAt.host(), sqlAt.port()),
-              new Engine(new TxnKvStore(txn, Awaiter.blocking())));
+              tuning.txn(TxnClient.Options.defaults()));
+      sqlTxn = txn;
+      sqlEngine = new Engine(new TxnKvStore(txn, Awaiter.blocking()), clock);
+      sql = PgServer.start(new InetSocketAddress(sqlAt.host(), sqlAt.port()), sqlEngine);
     }
     PgServer sqlServer = sql;
+    String httpText = args.option("http", null);
+    NodeHttp http =
+        httpText == null
+            ? null
+            : NodeHttp.start(
+                Args.hostPort(httpText),
+                new NodeHttp.Sources(
+                    "data node",
+                    self.value(),
+                    listenText,
+                    sqlText,
+                    clock,
+                    chaos,
+                    tuning,
+                    engine,
+                    store,
+                    null,
+                    sqlTxn,
+                    sqlEngine));
     onShutdown(() -> {
+      if (http != null) {
+        http.close();
+      }
       if (sqlServer != null) {
         try {
           sqlServer.close();
@@ -160,7 +185,21 @@ final class ShardedCommands {
             + ")"
             + (sqlServer == null
                 ? ""
-                : ", SQL on " + Args.hostPort(sqlText).host() + ":" + sqlServer.port()));
+                : ", SQL on " + Args.hostPort(sqlText).host() + ":" + sqlServer.port())
+            + (http == null
+                ? ""
+                : ", HTTP on " + Args.hostPort(httpText).host() + ":" + http.port()));
+    io.distdb.common.Log.info(
+        LOG,
+        "data node started",
+        "node",
+        self.value(),
+        "listen",
+        listenText,
+        "sql",
+        sqlText == null ? "-" : sqlText,
+        "tuning",
+        tuning.describe());
     out.flush();
     server.awaitTermination();
     return 0;
@@ -171,7 +210,16 @@ final class ShardedCommands {
     Args args =
         Args.parse(
             argv,
-            java.util.Set.of("data-dir", "id", "peers", "split-keys", "dead-after", "gc-lifetime"));
+            java.util.Set.of(
+                "data-dir",
+                "id",
+                "peers",
+                "split-keys",
+                "dead-after",
+                "gc-lifetime",
+                "http",
+                "tune",
+                "chaos"));
     if (!args.positional().isEmpty()) {
       throw new Args.UsageException("unexpected argument " + args.positional().getFirst());
     }
@@ -186,6 +234,12 @@ final class ShardedCommands {
     long splitKeys = Long.parseLong(args.option("split-keys", "" + defaults.splitKeys()));
     Duration deadAfter = Args.duration(args.option("dead-after", "30s"));
     Duration gcLifetime = Args.duration(args.option("gc-lifetime", "10m"));
+    Tuning tuning = Tuning.parse(args.option("tune", null));
+    boolean chaos = "on".equals(args.option("chaos", "off"));
+    SkewClock clock = new SkewClock();
+    if (System.getProperty("distdb.demo") == null) {
+      LogSetup.install("pd-" + self.value());
+    }
     DataDirLock lock = DataDirLock.acquire(dataDir, err);
     if (lock == null) {
       return 3;
@@ -196,14 +250,14 @@ final class ShardedCommands {
             LocalFileSystem.INSTANCE,
             scheduler,
             dataDir.resolve("engine"),
-            EngineOptions.defaults());
+            tuning.engine(EngineOptions.defaults()));
     GrpcTransport transport = new GrpcTransport(self, peers);
     ReplicatedKv kv =
         new ReplicatedKv(
-            ReplicatedKv.Config.defaults(self, peers),
+            tuned(ReplicatedKv.Config.defaults(self, peers), tuning),
             engine,
             transport,
-            SystemClock.INSTANCE,
+            clock,
             scheduler,
             SplittableRandomSource.fromEntropy(),
             failure -> halt(err, failure),
@@ -220,14 +274,14 @@ final class ShardedCommands {
                 defaults.maxOperators(),
                 true),
             kv,
-            SystemClock.INSTANCE,
+            clock,
             scheduler,
             SplittableRandomSource.fromEntropy());
     GrpcKvServer server =
         GrpcKvServer.start(
             new InetSocketAddress(listen.host(), listen.port()),
             driver,
-            SystemClock.INSTANCE,
+            clock,
             transport.service());
     kv.start();
     // The GC worker runs on whichever PD node leads, and reaches the ranges like any client.
@@ -236,7 +290,7 @@ final class ShardedCommands {
         new KvClient(
             selfPd,
             GrpcKvChannel::connect,
-            SystemClock.INSTANCE,
+            clock,
             scheduler,
             SplittableRandomSource.fromEntropy(),
             ClientOptions.defaults());
@@ -245,17 +299,39 @@ final class ShardedCommands {
             new TxnClient(
                 gcClient,
                 selfPd,
-                SystemClock.INSTANCE,
+                clock,
                 scheduler,
                 SplittableRandomSource.fromEntropy(),
-                TxnClient.Options.defaults()),
+                tuning.txn(TxnClient.Options.defaults())),
             selfPd,
             scheduler,
             gcLifetime,
             Duration.ofSeconds(30),
             driver::isLeader);
     gc.start();
+    String httpText = args.option("http", null);
+    NodeHttp http =
+        httpText == null
+            ? null
+            : NodeHttp.start(
+                Args.hostPort(httpText),
+                new NodeHttp.Sources(
+                    "placement driver",
+                    self.value(),
+                    peers.get(self),
+                    null,
+                    clock,
+                    chaos,
+                    tuning,
+                    engine,
+                    null,
+                    driver,
+                    null,
+                    null));
     onShutdown(() -> {
+      if (http != null) {
+        http.close();
+      }
       gc.stop();
       gcClient.close();
       selfPd.close();
@@ -312,6 +388,25 @@ final class ShardedCommands {
       }
       return KvCommand.OK;
     }
+  }
+
+  private static final System.Logger LOG = System.getLogger(ShardedCommands.class.getName());
+
+  private static Store.Config tuned(Store.Config c, Tuning t) {
+    return new Store.Config(
+        c.self(),
+        c.address(),
+        c.founders(),
+        t.raft(c.raft()),
+        c.kv(),
+        c.tick(),
+        c.compactEvery(),
+        c.heartbeatInterval());
+  }
+
+  private static ReplicatedKv.Config tuned(ReplicatedKv.Config c, Tuning t) {
+    return new ReplicatedKv.Config(
+        c.self(), c.peers(), t.raft(c.raft()), c.kv(), c.tick(), c.compactEvery());
   }
 
   private static void halt(PrintStream err, Throwable failure) {

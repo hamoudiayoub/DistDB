@@ -56,6 +56,28 @@ public final class TxnKvStore implements KvStore {
     return client.rangeSplits(start, end).size() + 1;
   }
 
+  @Override
+  public ClusterView cluster() {
+    io.distdb.rpc.proto.ListRangesResponse list = await(client.listRanges());
+    java.util.List<RangeRow> ranges = new java.util.ArrayList<>();
+    for (io.distdb.rpc.proto.RangeInfo r : list.getRangesList()) {
+      io.distdb.rpc.proto.RangeDescriptor d = r.getDesc();
+      ranges.add(
+          new RangeRow(
+              d.getRangeId(),
+              d.getStartKey().toByteArray(),
+              d.hasEndKey() ? d.getEndKey().toByteArray() : null,
+              r.getLeader(),
+              java.util.List.copyOf(d.getVotersList()),
+              java.util.List.copyOf(d.getLearnersList())));
+    }
+    java.util.List<NodeRow> nodes = new java.util.ArrayList<>();
+    list.getStoresMap()
+        .forEach(
+            (id, address) -> nodes.add(new NodeRow(id, address, list.getAliveOrDefault(id, true))));
+    return new ClusterView(ranges, nodes);
+  }
+
   private <T> T await(CompletableFuture<T> f) {
     try {
       return awaiter.await(f);

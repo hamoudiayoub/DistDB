@@ -6,7 +6,7 @@ ranges, and any node answers SQL from `psql`. It is built bottom-up in ten phase
 ends at a **gate**, a test that proves it works, and leaves a design note in `docs/design/`.
 
 This document explains what each phase does, how it works, and what to learn from it.
-**Phases 1–9 are built** (with their measured results); **phase 10 is the plan.**
+**All ten phases are built**, each with its measured results.
 
 ```
  SQL (8, 9)      psql ─▶ pgwire ─▶ parser ─▶ planner ─▶ distributed executor
@@ -664,37 +664,111 @@ with and without. Numbers and their breakdown are in
 
 ---
 
-## Phase 10: Hardening and benchmarks *(planned)*
+## Phase 10: Hardening, observability, benchmarks, and the shell
 
-**Goal.** Prove that the real binaries, on real networks and disks, survive what the simulator
-models, and measure performance honestly.
+**Goal.** Prove that the real binaries, on a real network, real disks and real clocks, survive
+what the simulator models; measure performance honestly; and give the database a command line
+worth using.
 
-**What it will build.**
-- **A Docker Compose cluster and chaos suite:** kill nodes, partition with iptables, add latency
-  with Toxiproxy, skew clocks. Then check invariants: the bank test, and the linearizability
-  checker on recorded histories.
-- **Observability:**
-  - Prometheus metrics: Raft proposals, commit latency, elections, leader changes, ranges per
-    node, compaction bytes, transaction conflicts and retries;
-  - structured logs tagged with node, range and transaction ids;
-  - a `/debug` page per node.
-- **Benchmarks:**
-  - YCSB-style workloads on the engine and the KV layer;
-  - a TPC-C-style SQL workload (new-order, payment);
-  - throughput and p99 latency at 1, 3 and 5 nodes;
-  - recovery time after a leader crash;
-  - before/after numbers for each optimization: Raft batching and pipelining, group commit, TSO
-    batching, coprocessor pushdown.
+**What it builds.**
+- **`distdb sql`, the shell.** It speaks PostgreSQL's wire protocol (its own small client), so it
+  works against any node, and against PostgreSQL itself.
+  - JLine line editing: history, multi-line statements, highlighting as you type, and completion
+    of keywords, tables, columns and meta commands.
+  - A prompt that shows the transaction's state (`=>`, `*>`, `!>`).
+  - Framed tables: numbers right-aligned, NULLs dimmed, cut to the terminal's width, and the
+    expanded layout when too wide.
+  - `EXPLAIN ANALYZE` drawn as a tree, each operator with a bar of its own share of the time.
+  - Errors with their SQLSTATE and a hint.
+  - Meta commands: `\dt`, `\d`, `\di`, `\stats`, `\ranges`, `\nodes`, `\pushdown`, `\timing`, `\x`,
+    `\i`, `\conninfo`.
+  - Script mode (`-c`, `-f`, pipes) with psql's plain output.
 
-  The benchmarks run on local Docker, then briefly on 3 to 5 cloud VMs.
-- **The README:** an architecture diagram, a five-minute quick start (`docker compose up`, then
-  `psql`), and benchmark charts with hardware details.
+  New SQL statements back the meta commands, for every client: `SHOW TABLES`, `SHOW COLUMNS`,
+  `SHOW INDEXES`, `SHOW STATISTICS`, `SHOW RANGES` and `SHOW NODES`.
+- **`distdb demo`:** three PD nodes and three data nodes in one process, and the shell.
+- **Observability:** `--http` on every node.
+  - `/metrics` (Prometheus) covers Raft proposals, elections and leaderships; commit latency;
+    replicas and leaders; fsyncs and group-commit sizes; compaction bytes; transaction commits,
+    conflicts and lock resolutions; SQL statements, retries and latency; and the gateway's KV
+    traffic.
+  - `/debug` is a page for people: the node, and every range on it with its Raft state.
+  - Logs are one `key=value` event per line, with the node, range and transaction ids.
+- **Group commit** in the LSM engine: concurrent synced writers share one log write and one fsync
+  (LevelDB's writer queue).
+- **`--tune`** turns each optimization off (Raft batching, Raft pipelining, TSO batching, group
+  commit), for before/after numbers.
+- **`distdb-bench`**, a separate binary.
+  - YCSB A/B/C on the engine and on the KV layer at 1, 3 and 5 data nodes, against real
+    processes.
+  - TPC-C's new-order and payment over JDBC, followed by three of TPC-C's consistency checks.
+  - Recovery after `kill -9` of a leader.
+  - Ablations.
+  - Open-loop latency measurement (no coordinated omission), and an HdrHistogram-style
+    histogram with 1% precision.
+  - JSON results and SVG charts.
+- **Docker Compose and the chaos suite** (`distdb-bench chaos`).
+  - The cluster: three PD nodes and five data nodes.
+  - The faults:
+    - kill -9 and restart;
+    - pause;
+    - iptables partitions, of one node or into a majority and a minority;
+    - netem latency;
+    - clock skew, through the nodes' clock seam;
+    - clock skew followed by a PD-leader failover.
+  - The checkers: a bank (conservation, audits), and register reads and writes checked for
+    linearizability with the Phase 5 checker.
 
-**Concepts to learn.** The gap between simulation and real systems; the Jepsen method; metrics
-and percentiles; coordinated omission; profiling (JFR); Little's law; batching, pipelining and
-group commit. *Read:* the Jepsen analyses of etcd, CockroachDB and TiDB.
+**Concepts to learn.**
+- The gap between simulation and the real thing, and the Jepsen method.
+- Metrics, percentiles and histograms; coordinated omission; open and closed loops; Little's law.
+- Batching, pipelining and group commit: where each one pays (round trips, messages, fsyncs).
+- Profiling (JFR), and counting fsyncs.
+- Terminal UIs: ANSI colors, display width, line editors.
 
-**Gate.** The chaos suite passes, and the README has benchmark charts.
+*Read:* the Jepsen analyses of etcd, CockroachDB and TiDB; Gil Tene's "How NOT to Measure Latency";
+LevelDB's `db_impl.cc` (`DBImpl::Write`).
+
+**How it's tested.**
+- **The chaos suite (the gate):** the real binaries in Docker, real faults, and a bank and a
+  register history checked for conservation and linearizability (above).
+- **The benchmarks,** against real processes: they check what they measure as they go. The open
+  loop counts from scheduled starts; TPC-C checks its consistency conditions afterwards.
+- **`GroupCommitTest`:** concurrent synced writers share fsyncs, and every write that returned
+  survives a crash of the simulated disk. All earlier engine tests, crash tests included, now run
+  through group commit.
+- **`ShellTest`, `RenderTest`, `SqlLexerTest`:** the shell end to end against a real wire-protocol
+  server; its layouts as text (colors never change the layout); where statements end.
+- **`SessionTest`:** the new `SHOW` statements.
+- **`ObservabilityTest`:** tuning, the HTTP endpoint, clock skew, and the log format.
+- **`MetricsAndLogTest`, `HistogramTest`:** both histograms' precision, and the Zipfian chooser.
+
+**Gate.** The chaos suite passed, and the README has the benchmark charts.
+- **Chaos:** 180 s, 10 faults, including two PD-leader kills onto lagging clocks. 1,111 transfers
+  committed, and all 203 audits balanced; the 2,096-operation register history is linearizable.
+- **Benchmarks, on one laptop:**
+  - **Group commit:** 11× for fsynced engine writes.
+  - **Writes are fsync-bound:** about 2 ms per fsync on NTFS, two fsyncs per write per replica.
+  - **Reads:** 5,696 a second on one node.
+  - **TPC-C:** 92 new-orders a minute, with its consistency conditions holding.
+  - **Recovery:** 0.9 s below half throughput after kill -9 of a leader.
+  - **TSO batching:** 10×.
+  - **Pushdown:** 1.8× in latency, and 99.5% fewer bytes on the real cluster.
+- **Planted bugs:** of five planted on purpose, all were caught, the TSO one only by the chaos
+  suite.
+- The full build passes: 306 tests.
+
+*Passed.* (Phases 6–10 are not committed yet.)
+
+**Lessons.**
+- The real thing differs from the model in ways that matter: fsync cost dominates writes here,
+  and a client waits for a dead node's deadline.
+- A latency number needs its load model. Open loops below capacity measure latency; anything
+  above capacity measures the queue.
+- Batching pays where the bottleneck is: grouping fsyncs and timestamps paid 1.25× and 10×.
+  Grouping messages paid nothing, because messages were not the bottleneck.
+- Some bugs need real clocks and real failover to show. A planted TSO bug the unit tests could not
+  see created money in the first minute of chaos.
 
 ---
 

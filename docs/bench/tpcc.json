@@ -1,0 +1,38 @@
+{
+  "suite": "tpcc",
+  "when": "2026-11-13T07:40:03.966288800Z",
+  "hardware": "Intel Core i5-13420H (8 cores, 12 threads), 7.7 GB RAM, Micron 512 GB NVMe SSD, Windows 11, Java 25",
+  "quick": false,
+  "warehouses": 2,
+  "customers_per_district": 100,
+  "items": 2000,
+  "terminals": 20,
+  "new_order": {
+    "ops": 46,
+    "errors": 0,
+    "seconds": 30,
+    "throughput_per_s": 1.530,
+    "p50_ms": 7701,
+    "p99_ms": 2.784e+04,
+    "p999_ms": 2.784e+04,
+    "max_ms": 2.784e+04
+  },
+  "payment": {
+    "ops": 67,
+    "errors": 0,
+    "seconds": 30,
+    "throughput_per_s": 2.230,
+    "p50_ms": 954.2,
+    "p99_ms": 1.365e+04,
+    "p999_ms": 1.365e+04,
+    "max_ms": 1.365e+04
+  },
+  "tpmC": 92,
+  "retries_after_40001": 149,
+  "gave_up": 0,
+  "consistency": [
+    "W_YTD = sum(D_YTD): ok",
+    "D_NEXT_O_ID - 1 = max(O_ID): ok",
+    "O_OL_CNT = count(order lines): ok"
+  ]
+}

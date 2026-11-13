@@ -10,6 +10,7 @@ import io.distdb.storage.StorageException;
 import io.distdb.storage.WriteBatch;
 import java.io.IOException;
 import java.nio.file.Path;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashSet;
@@ -22,6 +23,8 @@ import java.util.Set;
 import java.util.TreeMap;
 import java.util.TreeSet;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.LongAdder;
+import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
 
 /**
@@ -59,6 +62,74 @@ public final class LsmEngine implements KvEngine {
   private final TableCache tables;
 
   private final ReentrantLock writeLock = new ReentrantLock();
+
+  /**
+   * Group commit: writers queue here, and the one at the head writes the whole queue's batches with
+   * one log write and one fsync, while the others wait. Guarded by writeLock.
+   */
+  private final ArrayDeque<Writer> writers = new ArrayDeque<>();
+
+  private final Condition writersTurn = writeLock.newCondition();
+
+  /**
+   * Held by the group's leader while it writes the log without writeLock (so that more writers can
+   * queue meanwhile), and by close() before it touches the log. Order: writeLock, then logLock.
+   */
+  private final ReentrantLock logLock = new ReentrantLock();
+
+  private static final int MAX_GROUP = 256;
+
+  /** A write waiting in the queue; {@code done} once a leader wrote it (or failed to). */
+  private static final class Writer {
+    final WriteBatch batch;
+    final boolean sync;
+    boolean done;
+    RuntimeException failure;
+
+    Writer(WriteBatch batch, boolean sync) {
+      this.batch = batch;
+      this.sync = sync;
+    }
+  }
+
+  /**
+   * What this engine has done since it opened, for metrics. {@code groupCommits} counts the log
+   * writes that carried {@code groupedWrites} batches between them.
+   */
+  public record Stats(
+      long writes,
+      long walSyncs,
+      long groupCommits,
+      long groupedWrites,
+      long flushes,
+      long flushBytes,
+      long compactions,
+      long compactionBytesRead,
+      long compactionBytesWritten) {}
+
+  private final LongAdder statWrites = new LongAdder();
+  private final LongAdder statSyncs = new LongAdder();
+  private final LongAdder statGroups = new LongAdder();
+  private final LongAdder statGrouped = new LongAdder();
+  private final LongAdder statFlushes = new LongAdder();
+  private final LongAdder statFlushBytes = new LongAdder();
+  private final LongAdder statCompactions = new LongAdder();
+  private final LongAdder statCompactionRead = new LongAdder();
+  private final LongAdder statCompactionWritten = new LongAdder();
+
+  public Stats stats() {
+    return new Stats(
+        statWrites.sum(),
+        statSyncs.sum(),
+        statGroups.sum(),
+        statGrouped.sum(),
+        statFlushes.sum(),
+        statFlushBytes.sum(),
+        statCompactions.sum(),
+        statCompactionRead.sum(),
+        statCompactionWritten.sum());
+  }
+
   private final ReentrantLock flushLock = new ReentrantLock();
   private final ReentrantLock compactionLock = new ReentrantLock();
   private final Object viewLock = new Object();
@@ -196,12 +267,123 @@ public final class LsmEngine implements KvEngine {
   // ---------------------------------------------------------------------------------------------
   // Writes
 
+  /**
+   * {@inheritDoc}
+   *
+   * <p>With group commit, concurrent writers share one log write and one fsync: each queues its
+   * batch, and the writer at the head of the queue writes every queued batch, syncs once if any of
+   * them asked to, applies them in order, and wakes the others. No batch becomes visible, and no
+   * writer returns, before the write (and the fsync) that covers it.
+   */
   @Override
   public void write(WriteBatch batch, boolean sync) {
     Objects.requireNonNull(batch);
     if (batch.isEmpty()) {
       return;
     }
+    statWrites.increment();
+    if (!options.groupCommit()) {
+      writeAlone(batch, sync);
+      return;
+    }
+    Writer w = new Writer(batch, sync);
+    writeLock.lock();
+    try {
+      writers.addLast(w);
+      while (!w.done && writers.peekFirst() != w) {
+        writersTurn.awaitUninterruptibly();
+      }
+      if (w.done) {
+        if (w.failure != null) {
+          throw w.failure;
+        }
+        return;
+      }
+      lead(w);
+    } finally {
+      writeLock.unlock();
+    }
+    maybeScheduleBackgroundWork();
+  }
+
+  /** Called with writeLock held by the writer at the head of the queue: writes a group. */
+  private void lead(Writer head) {
+    List<Writer> group = new ArrayList<>();
+    RuntimeException failure = null;
+    try {
+      checkWritable();
+      makeRoomForWrite();
+      boolean sync = false;
+      long count = 0;
+      for (Writer x : writers) {
+        if (group.size() == MAX_GROUP) {
+          break;
+        }
+        group.add(x);
+        sync |= x.sync;
+        count += x.batch.count();
+      }
+      long first = lastSequence + 1;
+      if (first + count - 1 > InternalKey.MAX_SEQUENCE) {
+        throw new StorageException("sequence numbers exhausted");
+      }
+      List<byte[]> records = new ArrayList<>(group.size());
+      long seq = first;
+      for (Writer x : group) {
+        records.add(BatchCodec.encode(x.batch, seq));
+        seq += x.batch.count();
+      }
+      LogWriter log = wal;
+      // Let more writers queue (for the next group) while this one is written.
+      writeLock.unlock();
+      logLock.lock();
+      try {
+        for (byte[] r : records) {
+          log.add(r);
+        }
+        if (sync) {
+          log.sync();
+          statSyncs.increment();
+        }
+      } catch (IOException e) {
+        throw fail("write-ahead log write failed", e);
+      } finally {
+        logLock.unlock();
+        writeLock.lock();
+      }
+      checkWritable();
+      seq = first;
+      Memtable mem = currentView().mem();
+      for (Writer x : group) {
+        BatchCodec.apply(x.batch, seq, mem);
+        seq += x.batch.count();
+      }
+      lastSequence = first + count - 1;
+      synchronized (viewLock) {
+        visibleSequence = lastSequence;
+      }
+      statGroups.increment();
+      statGrouped.add(group.size());
+    } catch (RuntimeException e) {
+      failure = e;
+      throw e;
+    } finally {
+      if (group.isEmpty()) {
+        group.add(head);
+      }
+      for (Writer x : group) {
+        writers.remove(x);
+        x.done = true;
+        if (x != head) {
+          x.failure = failure;
+        }
+      }
+      writersTurn.signalAll();
+    }
+  }
+
+  /** The write path without group commit: one log write (and fsync) per batch, in turn. */
+  private void writeAlone(WriteBatch batch, boolean sync) {
     writeLock.lock();
     try {
       checkWritable();
@@ -211,9 +393,15 @@ public final class LsmEngine implements KvEngine {
         throw new StorageException("sequence numbers exhausted");
       }
       try {
-        wal.add(BatchCodec.encode(batch, first));
-        if (sync) {
-          wal.sync();
+        logLock.lock();
+        try {
+          wal.add(BatchCodec.encode(batch, first));
+          if (sync) {
+            wal.sync();
+            statSyncs.increment();
+          }
+        } finally {
+          logLock.unlock();
         }
       } catch (IOException e) {
         throw fail("write-ahead log write failed", e);
@@ -458,7 +646,9 @@ public final class LsmEngine implements KvEngine {
         VersionEdit edit = new VersionEdit();
         if (table != null) {
           edit.addFile(0, table);
+          statFlushBytes.add(table.size());
         }
+        statFlushes.increment();
         edit.setLogNumber(v.immNextLog()).setLastSequence(v.imm().maxSequence());
         versions.logAndApply(edit, nv -> installVersion(nv, true));
       } catch (IOException e) {
@@ -498,6 +688,16 @@ public final class LsmEngine implements KvEngine {
           return true;
         }
         List<FileMetadata> outputs = mergeInputs(c, base);
+        statCompactions.increment();
+        for (FileMetadata f : c.inputs()) {
+          statCompactionRead.add(f.size());
+        }
+        for (FileMetadata f : c.nextLevelInputs()) {
+          statCompactionRead.add(f.size());
+        }
+        for (FileMetadata f : outputs) {
+          statCompactionWritten.add(f.size());
+        }
         VersionEdit edit = new VersionEdit();
         for (FileMetadata f : c.inputs()) {
           edit.deleteFile(c.level(), f.number());
@@ -711,17 +911,22 @@ public final class LsmEngine implements KvEngine {
    */
   private void deleteObsoleteFiles() {
     synchronized (obsoleteLock) {
-      Set<Long> live = new HashSet<>();
-      synchronized (liveLock) {
-        for (Version v : liveVersions) {
-          live.addAll(v.fileNumbers());
-        }
-        live.addAll(pendingOutputs);
-      }
-      long minLog = versions.logNumber();
-      long manifest = versions.manifestNumber();
       try {
-        for (Path p : fs.list(dir)) {
+        // List first, then take the live set. A table in the listing exists, so its number was
+        // already pending (numbers are pending before their file is created) and stays pending
+        // until a live version holds it. The other order deletes a table that a concurrent flush
+        // or compaction creates between the two steps.
+        List<Path> files = fs.list(dir);
+        Set<Long> live = new HashSet<>();
+        synchronized (liveLock) {
+          for (Version v : liveVersions) {
+            live.addAll(v.fileNumbers());
+          }
+          live.addAll(pendingOutputs);
+        }
+        long minLog = versions.logNumber();
+        long manifest = versions.manifestNumber();
+        for (Path p : files) {
           String name = p.getFileName().toString();
           OptionalLong n = LsmFiles.number(name);
           boolean delete =
@@ -779,6 +984,7 @@ public final class LsmEngine implements KvEngine {
     }
     closed = true;
     writeLock.lock();
+    logLock.lock();
     flushLock.lock();
     compactionLock.lock();
     try {
@@ -793,6 +999,7 @@ public final class LsmEngine implements KvEngine {
       abandon();
       compactionLock.unlock();
       flushLock.unlock();
+      logLock.unlock();
       writeLock.unlock();
     }
   }

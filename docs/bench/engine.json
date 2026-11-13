@@ -1,0 +1,104 @@
+{
+  "suite": "engine",
+  "when": "2026-11-13T07:05:44.967861Z",
+  "hardware": "Intel Core i5-13420H (8 cores, 12 threads), 7.7 GB RAM, Micron 512 GB NVMe SSD, Windows 11, Java 25",
+  "quick": false,
+  "runs": [
+    {
+      "ops": 23095,
+      "errors": 0,
+      "seconds": 12,
+      "throughput_per_s": 1925,
+      "p50_ms": 0.3500,
+      "p99_ms": 1.670,
+      "p999_ms": 7.650,
+      "max_ms": 74.11,
+      "threads": 1,
+      "group_commit": false
+    },
+    {
+      "ops": 21691,
+      "errors": 0,
+      "seconds": 12,
+      "throughput_per_s": 1808,
+      "p50_ms": 0.1400,
+      "p99_ms": 26.02,
+      "p999_ms": 108.3,
+      "max_ms": 349.4,
+      "threads": 4,
+      "group_commit": false
+    },
+    {
+      "ops": 16589,
+      "errors": 0,
+      "seconds": 12,
+      "throughput_per_s": 1382,
+      "p50_ms": 0.1200,
+      "p99_ms": 194.5,
+      "p999_ms": 389.0,
+      "max_ms": 657.3,
+      "threads": 16,
+      "group_commit": false
+    },
+    {
+      "ops": 10981,
+      "errors": 0,
+      "seconds": 12,
+      "throughput_per_s": 915.1,
+      "p50_ms": 0.5000,
+      "p99_ms": 694.2,
+      "p999_ms": 1464,
+      "max_ms": 1824,
+      "threads": 32,
+      "group_commit": false
+    },
+    {
+      "ops": 20671,
+      "errors": 0,
+      "seconds": 12,
+      "throughput_per_s": 1723,
+      "p50_ms": 0.7400,
+      "p99_ms": 1.980,
+      "p999_ms": 6.010,
+      "max_ms": 182.1,
+      "threads": 1,
+      "group_commit": true
+    },
+    {
+      "ops": 55456,
+      "errors": 0,
+      "seconds": 12,
+      "throughput_per_s": 4621,
+      "p50_ms": 0.7800,
+      "p99_ms": 3.470,
+      "p999_ms": 24.05,
+      "max_ms": 98.97,
+      "threads": 4,
+      "group_commit": true
+    },
+    {
+      "ops": 186976,
+      "errors": 0,
+      "seconds": 12,
+      "throughput_per_s": 1.558e+04,
+      "p50_ms": 0.3900,
+      "p99_ms": 4.140,
+      "p999_ms": 10.52,
+      "max_ms": 40.84,
+      "threads": 16,
+      "group_commit": true
+    },
+    {
+      "ops": 89377,
+      "errors": 0,
+      "seconds": 12,
+      "throughput_per_s": 7448,
+      "p50_ms": 0.5000,
+      "p99_ms": 103.6,
+      "p999_ms": 145.2,
+      "max_ms": 235.6,
+      "threads": 32,
+      "group_commit": true
+    }
+  ]
+}

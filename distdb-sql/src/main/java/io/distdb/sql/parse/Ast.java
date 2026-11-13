@@ -30,6 +30,7 @@ public final class Ast {
           Rollback,
           SetVar,
           ShowVar,
+          ShowCatalog,
           Explain,
           Analyze {}
 
@@ -92,6 +93,22 @@ public final class Ast {
   public record SetVar(String name, String value) implements Statement {}
 
   public record ShowVar(String name) implements Statement {}
+
+  /**
+   * {@code SHOW TABLES}, {@code SHOW COLUMNS FROM t}, {@code SHOW INDEXES FROM t}, {@code SHOW
+   * STATISTICS FOR t}, {@code SHOW RANGES [FROM TABLE t]}, {@code SHOW NODES}: the catalog and the
+   * cluster as rows. {@code table} is null where there is none.
+   */
+  public record ShowCatalog(What what, String table) implements Statement {
+    public enum What {
+      TABLES,
+      COLUMNS,
+      INDEXES,
+      STATISTICS,
+      RANGES,
+      NODES
+    }
+  }
 
   /**
    * {@code EXPLAIN [ANALYZE] statement}: the plan, or (ANALYZE) the plan run, with what each

@@ -169,6 +169,88 @@ public final class Store implements KvHandler, AutoCloseable {
 
   // Everything below is touched only from mailbox tasks.
   private final TreeMap<Long, Replica> replicas = new TreeMap<>();
+
+  /** From a write's proposal to its applied answer, on the ranges this store leads. */
+  private final io.distdb.common.metrics.LatencyHistogram commitLatency =
+      new io.distdb.common.metrics.LatencyHistogram();
+
+  /** A replica as the debug page shows it. */
+  public record RangeStatus(
+      long id,
+      String start,
+      String end,
+      String role,
+      long term,
+      int leader,
+      long commit,
+      long applied,
+      long lastIndex,
+      List<Integer> voters,
+      List<Integer> learners) {}
+
+  /**
+   * What this store holds and has done: its replicas, their Raft counters summed (since each
+   * replica here started), and the commit latency of the writes it led.
+   */
+  public record Stats(
+      List<RangeStatus> ranges,
+      io.distdb.raft.RaftNode.Counters raft,
+      io.distdb.common.metrics.LatencyHistogram.Snapshot commitLatency) {
+    public long leaders() {
+      return ranges.stream().filter(r -> r.role().equals("LEADER")).count();
+    }
+  }
+
+  io.distdb.common.metrics.LatencyHistogram commitLatency() {
+    return commitLatency;
+  }
+
+  /** A snapshot of {@link Stats}, taken on the store's own thread. */
+  public java.util.concurrent.CompletableFuture<Stats> stats() {
+    java.util.concurrent.CompletableFuture<Stats> f =
+        new java.util.concurrent.CompletableFuture<>();
+    submit(() -> {
+      List<RangeStatus> out = new ArrayList<>();
+      long proposals = 0;
+      long elections = 0;
+      long leaderships = 0;
+      long appends = 0;
+      long entries = 0;
+      for (Replica r : replicas.values()) {
+        io.distdb.raft.RaftNode.Status st = r.raft.status();
+        RangeDescriptor d = r.descriptor();
+        out.add(
+            new RangeStatus(
+                r.id,
+                io.distdb.common.encoding.KeyReader.toDebugString(d.getStartKey().toByteArray()),
+                d.hasEndKey()
+                    ? io.distdb.common.encoding.KeyReader.toDebugString(d.getEndKey().toByteArray())
+                    : "",
+                st.role().name(),
+                st.term(),
+                st.leader() == null ? 0 : st.leader().value(),
+                st.commit(),
+                st.applied(),
+                st.lastIndex(),
+                List.copyOf(d.getVotersList()),
+                List.copyOf(d.getLearnersList())));
+        io.distdb.raft.RaftNode.Counters c = r.raft.counters();
+        proposals += c.proposals();
+        elections += c.elections();
+        leaderships += c.leaderships();
+        appends += c.appendsSent();
+        entries += c.entriesSent();
+      }
+      f.complete(
+          new Stats(
+              out,
+              new io.distdb.raft.RaftNode.Counters(
+                  proposals, elections, leaderships, appends, entries),
+              commitLatency.snapshot()));
+    });
+    return f;
+  }
+
   private final LinkedHashSet<Replica> dirty = new LinkedHashSet<>();
   private final Map<NodeId, List<StoreFrames.Item>> outbox = new TreeMap<>(BY_VALUE);
   private final Map<NodeId, String> addresses = new ConcurrentHashMap<>(); // read by the transport
@@ -557,6 +639,22 @@ public final class Store implements KvHandler, AutoCloseable {
     while (failure == null && !stopped && replicas.get(r.id) == r && r.raft.hasReady()) {
       Ready rd = r.raft.ready();
       r.raftStore.save(rd); // synced: nothing in this Ready may be seen before it is on disk
+      if (r.raft.role() != r.loggedRole) {
+        r.loggedRole = r.raft.role();
+        io.distdb.common.Log.info(
+            LOG,
+            "raft role changed",
+            "node",
+            config.self().value(),
+            "range",
+            r.id,
+            "role",
+            r.loggedRole.name().toLowerCase(java.util.Locale.ROOT),
+            "term",
+            r.raft.term(),
+            "leader",
+            r.raft.leader() == null ? 0 : r.raft.leader().value());
+      }
       long configIndex = r.raft.configIndex();
       for (Message m : rd.messages()) {
         // The stamp tells the receiver "my latest configuration, at this index, counts you", so a
@@ -568,6 +666,15 @@ public final class Store implements KvHandler, AutoCloseable {
       }
       if (rd.snapshot() != null && rd.snapshotReplacesLog()) {
         r.machine.restore(rd.snapshot());
+        io.distdb.common.Log.info(
+            LOG,
+            "snapshot installed",
+            "node",
+            config.self().value(),
+            "range",
+            r.id,
+            "index",
+            rd.snapshot().index());
         if (observer != null) {
           observer.restored(config.self(), r.id, rd.snapshot());
         }
@@ -653,6 +760,8 @@ public final class Store implements KvHandler, AutoCloseable {
         RangeStateMachine.tombstoneKey(r.id), RangeStateMachine.tombstoneValue(confVer, held));
     engine.write(batch, true);
     replicas.remove(r.id);
+    io.distdb.common.Log.info(
+        LOG, "replica destroyed", "node", config.self().value(), "range", r.id);
     dirty.remove(r);
     if (observer != null) {
       observer.destroyed(config.self(), r.id);

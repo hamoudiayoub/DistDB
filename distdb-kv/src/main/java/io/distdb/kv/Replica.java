@@ -34,6 +34,9 @@ final class Replica {
   final RangeStateMachine machine;
   final RaftNode raft;
 
+  /** The role last logged for this replica (the store logs each change). */
+  RaftNode.Role loggedRole = RaftNode.Role.FOLLOWER;
+
   private final Store store;
 
   private final Map<KvStateMachine.RequestKey, List<CompletableFuture<KvResponse>>> writes =
@@ -147,6 +150,7 @@ final class Replica {
       result.complete(store.notLeader(this, false));
       return;
     }
+    recordCommitLatency(result);
     KvStateMachine.RequestKey key = KvStateMachine.RequestKey.of(request);
     writes.computeIfAbsent(key, k -> new ArrayList<>()).add(result);
     // Past the deadline the client has given up; the entry may still commit, so no answer is the
@@ -189,6 +193,7 @@ final class Replica {
       result.complete(store.notLeader(this, false));
       return;
     }
+    recordCommitLatency(result);
     commands.put(id, result);
     long proposal = id;
     if (deadline != KvHandler.NO_DEADLINE) {
@@ -203,6 +208,16 @@ final class Replica {
                     result.cancel(false);
                   }));
     }
+  }
+
+  /** Times a proposed write, from now to its applied answer, for the commit-latency metric. */
+  private void recordCommitLatency(CompletableFuture<KvResponse> result) {
+    long proposed = store.clock().nanoTime();
+    result.whenComplete((response, failure) -> {
+      if (response != null && !response.hasError()) {
+        store.commitLatency().record(store.clock().nanoTime() - proposed);
+      }
+    });
   }
 
   void startRead(KvRequest request, long deadline, CompletableFuture<KvResponse> result) {

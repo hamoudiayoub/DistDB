@@ -10,6 +10,7 @@ grpc = "1.85.1"
 protobuf = "4.36.2"
 protobufPlugin = "0.10.0"
 postgresql = "42.7.4"
+jline = "3.30.17"
 
 [libraries]
 junit-bom = { module = "org.junit:junit-bom", version.ref = "junit" }
@@ -25,4 +26,5 @@ grpc-protobuf = { module = "io.grpc:grpc-protobuf", version.ref = "grpc" }
 grpc-netty-shaded = { module = "io.grpc:grpc-netty-shaded", version.ref = "grpc" }
 protobuf-java = { module = "com.google.protobuf:protobuf-java", version.ref = "protobuf" }
 postgresql-jdbc = { module = "org.postgresql:postgresql", version.ref = "postgresql" }
+jline = { module = "org.jline:jline", version.ref = "jline" }
 

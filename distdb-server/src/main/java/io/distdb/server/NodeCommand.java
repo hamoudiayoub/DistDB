@@ -42,7 +42,19 @@ final class NodeCommand {
 
   static int run(List<String> argv, PrintStream out, PrintStream err) throws Exception {
     Args args =
-        Args.parse(argv, Set.of("data-dir", "listen", "id", "peers", "pd", "founders", "sql"));
+        Args.parse(
+            argv,
+            Set.of(
+                "data-dir",
+                "listen",
+                "id",
+                "peers",
+                "pd",
+                "founders",
+                "sql",
+                "http",
+                "tune",
+                "chaos"));
     if (!args.positional().isEmpty()) {
       throw new Args.UsageException("unexpected argument " + args.positional().getFirst());
     }

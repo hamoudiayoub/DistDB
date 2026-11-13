@@ -600,3 +600,108 @@ first run:
     the big table, and no scan of it.
 - **Lesson:** an oracle checks answers, not choices. A decision made only for speed needs a test
   that pins the decision. And a reference implementation cannot check what it leaves undefined.
+
+---
+
+## 2026-11-13 — Group commit only groups if the leader lets go of the lock
+
+- **The trap (caught while designing, before any code ran):** the obvious sketch keeps the write
+  lock while the group's leader writes and fsyncs the log. Concurrent writers would then wait on
+  the lock instead of joining the queue. When the leader finished, the next writer would find an
+  empty queue and lead a group of one: no grouping at all.
+- **Why:** a writer can only join the next group if it can queue while the current group is being
+  written. That means the leader must release the lock during the I/O. Releasing it opens a
+  second problem: `close()` takes the same lock, and could close the log under the leader.
+- **What was built:** LevelDB's design.
+  - Writers queue on a condition.
+  - The head of the queue writes every queued batch with the lock released.
+  - A separate log lock orders the leader's I/O against `close()`.
+  - The leader then applies the group in order, publishes the new sequence, and wakes the others.
+
+  On this laptop's NVMe drive (YCSB-A with fsynced writes, 4 threads) it took the engine from 898
+  to 4,125 operations a second.
+- **Lesson:** batching needs a place to wait that is not the critical section. The rule that keeps
+  it correct fits in one line: nothing is visible, and nobody returns, before the fsync that
+  covers it. `GroupCommitTest` crashes the simulated disk after concurrent writers return, and
+  checks that every returned write survives.
+
+---
+
+## 2026-11-13 — A write costs two fsyncs, and on Windows an fsync costs 2 ms
+
+- **Symptom:** a single put on a one-node cluster took 5.8 ms at the median on localhost. The
+  server's own commit-latency histogram said 4.3 ms of that was inside the node.
+- **Cause:** the node's metrics showed 2,606 fsyncs for 1,301 writes. Each write is fsynced
+  twice: once as a Raft log entry (it must be durable before it counts toward the quorum), and
+  once when the state machine applies it. NTFS's `FlushFileBuffers` on this laptop takes about
+  2 ms.
+- **Not fixed (yet):** the second fsync is not needed for safety. The log is durable, so applied
+  state can be rebuilt by replaying it. Dropping it requires storing the applied index with the
+  data, and replaying past it on restart. That changes the recovery contract of Phases 5 and 6,
+  which the simulator would have to re-check. Recorded as the top item for later.
+- **Lesson:** count the fsyncs before tuning anything. On real disks they set the floor for
+  write latency. A metric that is cheap to add (fsyncs per write) explained the number at once.
+
+---
+
+## 2026-11-13 — Why every latency number here comes from an open loop
+
+- **The trap:** coordinated omission. A closed-loop client sends its next request only when the
+  last one answers. During a stall, a leader crash say, each client has one request outstanding,
+  and every request it would have sent meanwhile is never sent, so never measured. The benchmark
+  slows down with the system and records a handful of slow requests instead of hundreds. Its p99
+  then looks fine across an outage.
+- **What was built:** `Runner.open`, an open loop. Requests start on a fixed schedule whatever
+  happens, and each one's latency counts from when it was supposed to start, so a stall is charged
+  to every request it delayed. Closed loops remain, for finding maximum throughput only. The
+  latency charts and the recovery timeline are all open-loop.
+- **Lesson:** a latency percentile is only meaningful together with the load model that produced
+  it. Ask "measured from when?" before trusting any p99.
+
+---
+
+## 2026-11-13 — The shell showed every operator at 100% of the time
+
+- **Symptom:** the first `EXPLAIN ANALYZE` tree in the shell drew a full time bar on every
+  operator.
+- **Cause:** each operator's time includes its inputs' time: a project over a merge over a
+  remote scan reports 26 ms three times. Bars of inclusive time all reach the top.
+- **Fix:** each bar shows the operator's own time, its time minus its inputs', as a share of the
+  statement's total, so the bars answer "where did the time go?".
+- **Lesson:** inclusive and exclusive time answer different questions. Profilers show both for
+  this reason, and a display has to say which one it draws.
+
+---
+
+## 2026-11-13 — An open loop above capacity measures the queue, not the system
+
+- **Symptom:** the first full benchmark run reported a 12.2 s "unavailability" after killing a
+  leader, and KV p50 latencies of 2–3 s at "1,000 ops/s".
+- **Cause:** both open loops offered more than the cluster could take. The recovery run sent 800
+  writes a second, and the latency run's 50% writes made 500 a second, against a capacity of
+  about 340 writes a second on this disk. Requests queued from the first second. In the recovery
+  timeline, the five seconds before the kill were already almost all empty 100 ms buckets, so the
+  "outage" was the backlog.
+- **Fix:** rates below capacity: 150 writes a second for recovery, 200 operations a second for
+  latency. Then recovery came out at 0.9 s below half throughput, about Raft's election timeout,
+  and p50 at 13–17 ms. The recovery metric also uses a 500 ms moving window, because batched
+  writes complete in bursts.
+- **Lesson:** before reading an open-loop result, check that the system kept up before the event
+  you are measuring. Measure capacity first (closed loop), then latency well below it.
+
+---
+
+## 2026-11-13 — Deleting obsolete files deleted a table being born
+
+- **Symptom:** a full build failed once in `LsmEngineTest.concurrentUseOnTheRealFileSystem`: a
+  scan threw `NoSuchFileException` for `000025.sst`, a table in the version it held.
+- **Cause:** `deleteObsoleteFiles` took the live set (tables of live versions, plus pending
+  outputs) and then listed the directory. A flush on another thread could allocate table 25,
+  create it and install it between the two steps: the listing saw the file, the live set did not
+  name it, and it was deleted. Group commit, which lets more threads run during a write, made the
+  window easier to hit.
+- **Fix:** list the directory first, then take the live set. A table in the listing exists, so
+  its number was pending before the file was created, and it stays pending until a live version
+  holds it.
+- **Lesson:** a "what is in use" snapshot only protects what existed when it was taken. Take it
+  after the listing it filters, the way LevelDB holds its mutex across both.
