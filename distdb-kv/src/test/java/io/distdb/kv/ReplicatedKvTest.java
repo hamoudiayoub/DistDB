@@ -169,7 +169,7 @@ class ReplicatedKvTest {
     Group g = Group.of(1);
     g.put(ALICE, 1, 1, "k", "v");
     assertThat(keys(g.scan(new byte[0], null, 0).getScan())).containsExactly("k");
-    assertThat(g.get(ClientSessions.sessionKey(ALICE))).isEmpty();
+    assertThat(g.get(ClientSessions.sessionKey(ALICE, new byte[0]))).isEmpty();
   }
 
   // ---------------------------------------------------------------------------------------------

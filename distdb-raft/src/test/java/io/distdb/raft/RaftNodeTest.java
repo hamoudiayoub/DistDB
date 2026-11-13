@@ -203,7 +203,7 @@ class RaftNodeTest {
     long term = c.node(2).status().term();
     c.crash(2);
     c.restart(2);
-    c.node(2).step(new Message.RequestVote(c.id(3), c.id(2), term, 1_000, term, false));
+    c.node(2).step(new Message.RequestVote(c.id(3), c.id(2), term, 1_000, term, false, false));
     c.process();
     Message answer = c.queue.peekLast();
     assertThat(answer).isInstanceOf(Message.VoteResponse.class);
@@ -342,6 +342,96 @@ class RaftNodeTest {
       c.deliverAll();
     }
     assertThat(c.reads.get(c.id(1))).isEmpty();
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // Leadership transfer
+
+  @Test
+  void aLeaderHandsOverToAFollowerThatStillHearsFromIt() {
+    TestCluster c = TestCluster.of(3); // pre-vote and check-quorum on: followers are in a lease
+    c.elect(1);
+    long term = c.node(1).status().term();
+    assertThat(c.node(1).transferLeadership(c.id(2))).isTrue();
+    c.deliverAll();
+    assertThat(c.leaders()).containsExactly(c.id(2));
+    assertThat(c.node(2).status().term()).isEqualTo(term + 1);
+    assertThat(c.node(2).propose(utf8("after"))).isTrue();
+    c.deliverAll();
+    c.tickAll(3);
+    for (int i = 1; i <= 3; i++) {
+      assertThat(c.applied(i)).containsExactly("after");
+    }
+  }
+
+  @Test
+  void aLaggingTargetIsBroughtUpToDateBeforeItIsToldToCampaign() {
+    TestCluster c = TestCluster.of(3);
+    c.elect(1);
+    c.drop = m -> m.to().equals(c.id(3));
+    for (String s : List.of("a", "b", "c")) {
+      c.node(1).propose(utf8(s));
+    }
+    c.deliverAll();
+    assertThat(c.node(3).status().lastIndex()).isLessThan(c.node(1).status().lastIndex());
+    c.drop = m -> false;
+    assertThat(c.node(1).transferLeadership(c.id(3))).isTrue();
+    c.deliverAll();
+    assertThat(c.leaders()).containsExactly(c.id(3));
+    c.tickAll(3);
+    assertThat(c.applied(3)).containsExactly("a", "b", "c");
+    assertThat(c.sent)
+        .filteredOn(m -> m instanceof Message.TimeoutNow)
+        .as("sent only once the target matched the leader's log")
+        .isNotEmpty();
+  }
+
+  @Test
+  void proposalsWaitDuringATransferAndATransferToADeadNodeIsAbandoned() {
+    TestCluster c = TestCluster.of(3);
+    c.elect(1);
+    c.crash(3);
+    assertThat(c.node(1).transferLeadership(c.id(3))).isTrue();
+    assertThat(c.node(1).status().transferee()).isEqualTo(c.id(3));
+    assertThat(c.node(1).propose(utf8("x"))).as("refused while handing over").isFalse();
+    c.tickAll(RaftConfig.defaults(c.id(1)).electionTicks());
+    assertThat(c.leaders()).containsExactly(c.id(1));
+    assertThat(c.node(1).status().transferee()).isNull();
+    assertThat(c.node(1).propose(utf8("x"))).as("taken again once abandoned").isTrue();
+  }
+
+  @Test
+  void aLearnerThatLostItsLogIsCaughtUpAgainFromASnapshot() {
+    TestCluster c = TestCluster.of(3);
+    c.elect(1);
+    c.addEmpty(4);
+    assertThat(
+            c.node(1).proposeConfigChange(new ConfigChange(ConfigChange.Kind.ADD_LEARNER, c.id(4))))
+        .isTrue();
+    for (String s : List.of("a", "b", "c")) {
+      c.node(1).propose(utf8(s));
+    }
+    c.deliverAll();
+    c.tickAll(3);
+    assertThat(c.applied(4)).containsExactly("a", "b", "c");
+    c.compact(1);
+    // Its host destroys it and creates it again, empty, under the same id.
+    c.nodes.remove(c.id(4));
+    c.stores.remove(c.id(4));
+    c.applied.remove(c.id(4));
+    c.addEmpty(4);
+    c.node(1).propose(utf8("d"));
+    c.tickAll(30);
+    assertThat(c.applied(4)).containsExactly("a", "b", "c", "d");
+  }
+
+  @Test
+  void onlyAnotherVoterCanBeTheTarget() {
+    TestCluster c = TestCluster.of(3);
+    c.elect(1);
+    assertThat(c.node(1).transferLeadership(c.id(1))).isFalse();
+    assertThat(c.node(1).transferLeadership(c.id(9))).isFalse();
+    assertThat(c.node(2).transferLeadership(c.id(3))).as("not the leader").isFalse();
   }
 
   // ---------------------------------------------------------------------------------------------

@@ -31,6 +31,7 @@ class RaftSimulationTest {
     long configChanges = 0;
     long sent = 0;
     long lost = 0;
+    long transfers = 0;
     for (long seed = first; seed <= last; seed++) {
       RaftSimulation.Report r;
       try {
@@ -50,11 +51,12 @@ class RaftSimulationTest {
       configChanges += r.configChanges();
       sent += r.messagesSent();
       lost += r.messagesLost();
+      transfers += r.leaderTransfers();
     }
     System.out.printf(
         "RaftSimulationTest: %d seeds; entries committed %d, leaders elected %d, proposals %d,"
             + " linearizable reads checked %d; power cuts %d, disk failures %d, partitions %d,"
-            + " snapshots installed %d, membership changes %d; messages %d, lost %d%n",
+            + " snapshots installed %d, membership changes %d, leadership transfers %d; messages %d, lost %d%n",
         last - first + 1,
         committed,
         leaders,
@@ -65,6 +67,7 @@ class RaftSimulationTest {
         partitions,
         snapshots,
         configChanges,
+        transfers,
         sent,
         lost);
     assertThat(committed).isPositive();
@@ -75,6 +78,7 @@ class RaftSimulationTest {
       assertThat(partitions).isPositive();
       assertThat(snapshots).isPositive();
       assertThat(configChanges).isPositive();
+      assertThat(transfers).isPositive();
       assertThat(reads).isPositive();
       assertThat(leaders).isGreaterThan(last - first + 1);
     }

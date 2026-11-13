@@ -4,13 +4,9 @@ import com.google.protobuf.ByteString;
 import com.google.protobuf.InvalidProtocolBufferException;
 import io.distdb.raft.Entry;
 import io.distdb.raft.Snapshot;
-import io.distdb.rpc.KvErrors;
 import io.distdb.rpc.proto.Command;
-import io.distdb.rpc.proto.DeleteResponse;
 import io.distdb.rpc.proto.KvRequest;
 import io.distdb.rpc.proto.KvResponse;
-import io.distdb.rpc.proto.PutResponse;
-import io.distdb.rpc.proto.WriteCommand;
 import io.distdb.storage.KvEngine;
 import io.distdb.storage.KvEntry;
 import io.distdb.storage.KvIterator;
@@ -23,7 +19,6 @@ import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.time.Duration;
 import java.util.Objects;
-import java.util.Optional;
 
 /**
  * The replicated state machine: applies committed log entries to the engine. Every replica applies
@@ -89,7 +84,12 @@ public final class KvStateMachine {
     if (e.type() == Entry.Type.NORMAL && e.data().length > 0) {
       Command c = parse(e.data());
       switch (c.getKindCase()) {
-        case WRITE -> result = applyWrite(batch, e.index(), c.getWrite());
+        case WRITE -> {
+          KvWrites.Result w =
+              KvWrites.apply(batch, engine, sessions, c.getWrite(), options, key -> true);
+          result = new Applied(e.index(), w.request(), w.response(), w.effect());
+        }
+        case SPLIT -> throw new IllegalStateException("a single group cannot split");
         case EXPIRE_SESSIONS ->
             sessions.expire(
                 batch,
@@ -102,49 +102,6 @@ public final class KvStateMachine {
     engine.write(batch, false); // the log is durable; a lost apply is replayed from it
     applied = e.index();
     return result;
-  }
-
-  private Applied applyWrite(WriteBatch batch, long index, WriteCommand w) {
-    KvRequest r = w.getRequest();
-    RequestKey key = RequestKey.of(r);
-    try {
-      KvRequests.validateWrite(r, options);
-    } catch (KvRequests.InvalidRequest bad) {
-      // The leader validates before proposing; every replica still reaches the same answer.
-      return new Applied(index, key, KvErrors.invalidArgument(bad.getMessage()), false);
-    }
-    byte[] clientId = r.getRequestId().getClientId().toByteArray();
-    long seq = r.getRequestId().getSeq();
-    ClientSessions.Session session = sessions.load(clientId);
-    if (seq < session.floor()) {
-      return new Applied(
-          index,
-          key,
-          KvErrors.staleRequest("write " + seq + " is below its client's floor " + session.floor()),
-          false);
-    }
-    Optional<KvResponse> earlier = sessions.result(clientId, seq);
-    if (earlier.isPresent()) {
-      return new Applied(index, key, earlier.get(), false); // a retry: never applied twice
-    }
-    KvResponse response;
-    if (r.hasPut()) {
-      batch.put(
-          KeySpace.user(r.getPut().getKey().toByteArray()), r.getPut().getValue().toByteArray());
-      response = KvResponse.newBuilder().setPut(PutResponse.getDefaultInstance()).build();
-    } else {
-      batch.delete(KeySpace.user(r.getDelete().getKey().toByteArray()));
-      response = KvResponse.newBuilder().setDelete(DeleteResponse.getDefaultInstance()).build();
-    }
-    sessions.record(
-        batch,
-        clientId,
-        session,
-        seq,
-        r.getFirstIncompleteSeq(),
-        response,
-        w.getProposeTimeMillis());
-    return new Applied(index, key, response, true);
   }
 
   /**

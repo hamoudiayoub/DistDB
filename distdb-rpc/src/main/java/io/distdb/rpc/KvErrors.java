@@ -1,10 +1,12 @@
 package io.distdb.rpc;
 
 import io.distdb.rpc.proto.DeadlineExceeded;
+import io.distdb.rpc.proto.EpochMismatch;
 import io.distdb.rpc.proto.Error;
 import io.distdb.rpc.proto.InvalidArgument;
 import io.distdb.rpc.proto.KvResponse;
 import io.distdb.rpc.proto.NotLeader;
+import io.distdb.rpc.proto.RangeNotFound;
 import io.distdb.rpc.proto.ServerBusy;
 import io.distdb.rpc.proto.StaleRequest;
 import io.distdb.rpc.proto.StorageFailure;
@@ -52,6 +54,14 @@ public final class KvErrors {
                     .setLeaderAddress(leaderAddress)
                     .setMaybeApplied(maybeApplied)),
         message);
+  }
+
+  public static KvResponse rangeNotFound(String message) {
+    return of(Error.newBuilder().setRangeNotFound(RangeNotFound.getDefaultInstance()), message);
+  }
+
+  public static KvResponse epochMismatch(String message) {
+    return of(Error.newBuilder().setEpochMismatch(EpochMismatch.getDefaultInstance()), message);
   }
 
   public static KvResponse staleRequest(String message) {

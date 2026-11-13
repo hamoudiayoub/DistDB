@@ -568,6 +568,10 @@ public final class ReplicatedKvSimulation {
 
     /** Crash-only: a storage error kills the process, which restarts from disk. */
     void storageFailed(Throwable t) {
+      if (!(t instanceof StorageException) || !fs.isDead()) {
+        // Only a failing disk may stop a replica; anything else is a bug the restart would hide.
+        violation = violation != null ? violation : new AssertionError(id + " stopped", t);
+      }
       diskFailures++;
       scheduler.execute(() -> {
         crash();

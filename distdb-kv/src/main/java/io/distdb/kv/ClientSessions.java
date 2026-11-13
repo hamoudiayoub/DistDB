@@ -13,16 +13,19 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Optional;
+import java.util.function.BiConsumer;
 
 /**
  * The table that makes retried writes safe: for each client, the answers to its recent writes,
  * stored in the engine next to the data (the pattern of section 6.3 of Ongaro's Raft thesis).
  *
- * <p>Records, in the {@link KeySpace#LOCAL local} key space:
+ * <p>Records, in the {@link KeySpace#LOCAL local} key space, under a <b>scope</b>: empty for a
+ * single group (Phase 5), the range id for one range of a sharded store, so that every range has
+ * its own table and a range's snapshot can carry it:
  *
  * <pre>
- *   0x01 's' clientId            → floor (8 bytes) | lastActiveMillis (8 bytes)
- *   0x01 'r' clientId seq(8, BE) → the KvResponse sent for that write
+ *   0x01 's' scope clientId            → floor (8 bytes) | lastActiveMillis (8 bytes)
+ *   0x01 'r' scope clientId seq(8, BE) → the KvResponse sent for that write
  * </pre>
  *
  * <p>The rules:
@@ -51,9 +54,15 @@ final class ClientSessions {
   }
 
   private final KvEngine engine;
+  private final byte[] scope;
 
   ClientSessions(KvEngine engine) {
+    this(engine, new byte[0]);
+  }
+
+  ClientSessions(KvEngine engine, byte[] scope) {
     this.engine = engine;
+    this.scope = scope.clone();
   }
 
   Session load(byte[] clientId) {
@@ -103,20 +112,20 @@ final class ClientSessions {
    */
   int expire(WriteBatch batch, long nowMillis, Duration ttl) {
     List<byte[]> expired = new ArrayList<>();
-    byte[] start = KeySpace.local(KeySpace.SESSION);
-    byte[] end = KeySpace.local((byte) (KeySpace.SESSION + 1));
-    try (KvIterator it = engine.scan(start, end)) {
+    byte[][] sessions = sessionSpan();
+    int idAt = 2 + scope.length;
+    try (KvIterator it = engine.scan(sessions[0], sessions[1])) {
       while (it.hasNext()) {
         KvEntry e = it.next();
         long lastActive = KeySpace.readUint64(e.value(), 8);
         if (nowMillis - lastActive > ttl.toMillis()) {
-          expired.add(Arrays.copyOfRange(e.key(), 2, 2 + CLIENT_ID_BYTES));
+          expired.add(Arrays.copyOfRange(e.key(), idAt, idAt + CLIENT_ID_BYTES));
         }
       }
     }
     for (byte[] clientId : expired) {
       batch.delete(sessionKey(clientId));
-      byte[] prefix = KeySpace.local(KeySpace.RESULT, clientId);
+      byte[] prefix = KeySpace.local(KeySpace.RESULT, scope, clientId);
       for (byte[] key : keysIn(prefix, Bytes.prefixEnd(prefix).orElseThrow())) {
         batch.delete(key);
       }
@@ -124,12 +133,54 @@ final class ClientSessions {
     return expired.size();
   }
 
+  /**
+   * Adds to {@code batch} a copy of this whole table (sessions and results) into {@code target}'s
+   * scope. A split gives the new range a copy, so a write applied before the split and retried
+   * after it is still recognized there.
+   */
+  void copyTo(WriteBatch batch, ClientSessions target) {
+    forEach(target.scope, batch::put);
+  }
+
+  /** Every record of this table, with its key rewritten into scope {@code as}. */
+  void forEach(byte[] as, BiConsumer<byte[], byte[]> sink) {
+    int from = 2 + scope.length;
+    for (byte[][] span : spans()) {
+      try (KvIterator it = engine.scan(span[0], span[1])) {
+        while (it.hasNext()) {
+          KvEntry e = it.next();
+          byte[] rest = Arrays.copyOfRange(e.key(), from, e.key().length);
+          sink.accept(KeySpace.local(e.key()[1], as, rest), e.value());
+        }
+      }
+    }
+  }
+
+  /** Adds to {@code batch} the deletion of this whole table. */
+  void deleteAll(WriteBatch batch) {
+    for (byte[][] span : spans()) {
+      for (byte[] key : keysIn(span[0], span[1])) {
+        batch.delete(key);
+      }
+    }
+  }
+
+  /** The engine spans this table occupies: results, then sessions. */
+  byte[][][] spans() {
+    byte[] results = KeySpace.local(KeySpace.RESULT, scope);
+    return new byte[][][] {{results, Bytes.prefixEnd(results).orElseThrow()}, sessionSpan()};
+  }
+
+  private byte[][] sessionSpan() {
+    byte[] sessions = KeySpace.local(KeySpace.SESSION, scope);
+    return new byte[][] {sessions, Bytes.prefixEnd(sessions).orElseThrow()};
+  }
+
   /** How many sessions exist; for tests and the debug page. */
   int count() {
+    byte[][] sessions = sessionSpan();
     int n = 0;
-    try (KvIterator it =
-        engine.scan(
-            KeySpace.local(KeySpace.SESSION), KeySpace.local((byte) (KeySpace.SESSION + 1)))) {
+    try (KvIterator it = engine.scan(sessions[0], sessions[1])) {
       while (it.hasNext()) {
         it.next();
         n++;
@@ -148,12 +199,17 @@ final class ClientSessions {
     return keys;
   }
 
-  static byte[] sessionKey(byte[] clientId) {
-    return KeySpace.local(KeySpace.SESSION, clientId);
+  private byte[] sessionKey(byte[] clientId) {
+    return KeySpace.local(KeySpace.SESSION, scope, clientId);
   }
 
-  static byte[] resultKey(byte[] clientId, long seq) {
-    return KeySpace.local(KeySpace.RESULT, clientId, KeySpace.uint64(seq));
+  private byte[] resultKey(byte[] clientId, long seq) {
+    return KeySpace.local(KeySpace.RESULT, scope, clientId, KeySpace.uint64(seq));
+  }
+
+  /** The session key of a single group (empty scope); for tests. */
+  static byte[] sessionKey(byte[] clientId, byte[] scope) {
+    return KeySpace.local(KeySpace.SESSION, scope, clientId);
   }
 
   private static KvResponse parse(byte[] bytes) {

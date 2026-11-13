@@ -52,9 +52,11 @@ class RaftCodecTest {
     NodeId from = node();
     NodeId to = node();
     long term = r.nextLong(0, 1_000);
-    return switch (r.nextInt(7)) {
+    return switch (r.nextInt(8)) {
       case 0 ->
-          new Message.RequestVote(from, to, term, r.nextInt(500), r.nextInt(50), r.nextBoolean());
+          new Message.RequestVote(
+              from, to, term, r.nextInt(500), r.nextInt(50), r.nextBoolean(), r.nextBoolean());
+      case 7 -> new Message.TimeoutNow(from, to, term);
       case 1 -> new Message.VoteResponse(from, to, term, r.nextBoolean(), r.nextBoolean());
       case 2 -> {
         long prev = r.nextLong(0, 1_000);

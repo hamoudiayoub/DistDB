@@ -40,7 +40,10 @@ public final class RaftNode {
   /**
    * A read-only view, for hosts, tests and checkers.
    *
+   * @param membership the latest membership in the log, committed or not
+   * @param configIndex the index of the entry (or snapshot) that holds {@code membership}
    * @param match on a leader, each member's match index (its own is what it has stored)
+   * @param transferee on a leader handing over its leadership, the node it hands over to
    */
   public record Status(
       NodeId id,
@@ -52,7 +55,9 @@ public final class RaftNode {
       long snapshotIndex,
       long lastIndex,
       Membership membership,
-      Map<NodeId, Long> match) {}
+      long configIndex,
+      Map<NodeId, Long> match,
+      NodeId transferee) {}
 
   private static final Comparator<NodeId> BY_VALUE = Comparator.comparingInt(NodeId::value);
   private static final int MAX_APPLY_BATCH = 1024;
@@ -81,6 +86,7 @@ public final class RaftNode {
   private final Map<NodeId, Progress> progress = new TreeMap<>(BY_VALUE);
   private long leaderStartIndex;
   private long round;
+  private NodeId transferee; // a leadership transfer in progress, or null
   private final ArrayDeque<PendingRead> pendingReads = new ArrayDeque<>();
   private final List<byte[]> readsWaitingForCommit = new ArrayList<>();
 
@@ -152,7 +158,7 @@ public final class RaftNode {
     } else {
       electionElapsed++;
       if (electionElapsed >= randomizedElectionTimeout && membership.isVoter(id)) {
-        campaign(cfg.preVote());
+        campaign(cfg.preVote(), false);
       }
     }
   }
@@ -167,6 +173,9 @@ public final class RaftNode {
     }
     if (electionElapsed >= cfg.electionTicks()) {
       electionElapsed = 0;
+      // A transfer that has not finished within an election timeout has failed (the target is
+      // down, say): take proposals again.
+      transferee = null;
       if (cfg.checkQuorum() && !quorumActive()) {
         // Cut off from a majority: a new leader may already exist on the other side. Stepping
         // down stops this one serving reads it can no longer vouch for.
@@ -194,7 +203,8 @@ public final class RaftNode {
       return;
     }
     if (m.term() > term) {
-      if (m instanceof Message.RequestVote
+      if (m instanceof Message.RequestVote rv
+          && !rv.transfer()
           && cfg.checkQuorum()
           && leader != null
           && electionElapsed < cfg.electionTicks()) {
@@ -207,7 +217,8 @@ public final class RaftNode {
         boolean fromLeader =
             m instanceof Message.AppendEntries
                 || m instanceof Message.Heartbeat
-                || m instanceof Message.InstallSnapshot;
+                || m instanceof Message.InstallSnapshot
+                || m instanceof Message.TimeoutNow;
         becomeFollower(m.term(), fromLeader ? m.from() : null);
       }
     } else if (m.term() < term) {
@@ -245,6 +256,12 @@ public final class RaftNode {
           handleHeartbeatResponse(hr);
         }
       }
+      case Message.TimeoutNow t -> {
+        // The leader hands over: campaign at once, without pre-vote, and tell voters it was asked.
+        if (role != Role.LEADER && membership.isVoter(id)) {
+          campaign(false, true);
+        }
+      }
     }
   }
 
@@ -254,8 +271,8 @@ public final class RaftNode {
    * @return false if it is not the leader; the host should redirect the client
    */
   public boolean propose(byte[] command) {
-    if (role != Role.LEADER) {
-      return false;
+    if (role != Role.LEADER || transferee != null) {
+      return false; // during a transfer, so that the target can catch up
     }
     appendAsLeader(Entry.Type.NORMAL, command.clone());
     return true;
@@ -272,6 +289,7 @@ public final class RaftNode {
    */
   public boolean proposeConfigChange(ConfigChange change) {
     if (role != Role.LEADER
+        || transferee != null
         || configIndex > log.committed()
         || log.committed() < leaderStartIndex) {
       return false;
@@ -279,6 +297,43 @@ public final class RaftNode {
     Membership next = membership.apply(change);
     appendAsLeader(Entry.Type.CONFIG, RaftCodec.encodeMembership(next));
     return true;
+  }
+
+  /**
+   * Hands the leadership to voter {@code target} (thesis 3.10). The leader stops taking proposals,
+   * brings the target's log up to date, then sends it {@link Message.TimeoutNow} so it campaigns at
+   * once and wins. If that has not happened within an election timeout, the transfer is abandoned
+   * and this node leads on.
+   *
+   * @return false if this node is not the leader or {@code target} is not another voter
+   */
+  public boolean transferLeadership(NodeId target) {
+    if (role != Role.LEADER || target.equals(id) || !membership.isVoter(target)) {
+      return false;
+    }
+    if (target.equals(transferee)) {
+      return true;
+    }
+    transferee = target;
+    electionElapsed = 0;
+    Progress pr = progress.get(target);
+    if (pr.match == log.lastIndex()) {
+      send(new Message.TimeoutNow(id, target, term));
+    } else {
+      replicateTo(target, pr, true);
+    }
+    return true;
+  }
+
+  /**
+   * Starts an election now instead of waiting for the timeout, if this node is a voter and not the
+   * leader. With pre-vote on, it first asks; so it cannot depose a leader the others still follow.
+   * Used for a range just created by a split, whose old leader is the natural new one.
+   */
+  public void campaignNow() {
+    if (role != Role.LEADER && membership.isVoter(id)) {
+      campaign(cfg.preVote(), false);
+    }
   }
 
   /**
@@ -397,7 +452,39 @@ public final class RaftNode {
         log.snapshotIndex(),
         log.lastIndex(),
         membership,
-        Collections.unmodifiableMap(match));
+        configIndex,
+        Collections.unmodifiableMap(match),
+        transferee);
+  }
+
+  // Cheap views of single fields, for hosts that check them per message (status() copies maps).
+
+  public Role role() {
+    return role;
+  }
+
+  /** The leader this node follows (itself if it leads), or null if it knows none. */
+  public NodeId leader() {
+    return leader;
+  }
+
+  public long term() {
+    return term;
+  }
+
+  /** The latest membership in the log, committed or not. */
+  public Membership membership() {
+    return membership;
+  }
+
+  /** The index of the entry (or snapshot) holding {@link #membership()}. */
+  public long configIndex() {
+    return configIndex;
+  }
+
+  /** The index of the last entry in the log (the snapshot's, if the log is empty). */
+  public long lastIndex() {
+    return log.lastIndex();
   }
 
   /** Entries {@code from..to} inclusive, which must be in the log (not compacted). */
@@ -413,7 +500,7 @@ public final class RaftNode {
   // -----------------------------------------------------------------------------------------------
   // Elections
 
-  private void campaign(boolean pre) {
+  private void campaign(boolean pre, boolean transfer) {
     if (pre) {
       role = Role.PRE_CANDIDATE;
     } else {
@@ -433,14 +520,16 @@ public final class RaftNode {
     long voteTerm = pre ? term + 1 : term;
     for (NodeId v : membership.voters()) {
       if (!v.equals(id)) {
-        send(new Message.RequestVote(id, v, voteTerm, log.lastIndex(), log.lastTerm(), pre));
+        send(
+            new Message.RequestVote(
+                id, v, voteTerm, log.lastIndex(), log.lastTerm(), pre, transfer));
       }
     }
   }
 
   private void won(boolean pre) {
     if (pre) {
-      campaign(false);
+      campaign(false, false);
     } else {
       becomeLeader();
     }
@@ -505,6 +594,7 @@ public final class RaftNode {
     }
     role = Role.FOLLOWER;
     leader = newLeader;
+    transferee = null;
     resetElectionTimer();
     progress.clear();
     votes.clear();
@@ -515,6 +605,7 @@ public final class RaftNode {
   private void becomeLeader() {
     role = Role.LEADER;
     leader = id;
+    transferee = null;
     resetElectionTimer();
     progress.clear();
     for (NodeId m : membership.members()) {
@@ -644,6 +735,13 @@ public final class RaftNode {
       if (stale) {
         return;
       }
+      if (ar.conflictTerm() == 0 && ar.conflictIndex() <= pr.match) {
+        // Its log now ends before what it once acknowledged: it lost entries. A host can do that
+        // to a replica it destroyed and created again (a learner removed and being added back,
+        // say); Raft never does. Start over from what it has, or it would be probed forever just
+        // past an index it no longer holds.
+        pr.match = ar.conflictIndex() - 1;
+      }
       long next;
       if (ar.conflictTerm() > 0) {
         long last = log.lastIndexOfTerm(ar.conflictTerm());
@@ -669,6 +767,9 @@ public final class RaftNode {
         }
       }
       case REPLICATE -> pr.freeInflightTo(ar.index());
+    }
+    if (ar.from().equals(transferee) && pr.match == log.lastIndex()) {
+      send(new Message.TimeoutNow(id, transferee, term)); // caught up: hand over
     }
     if (advanced && maybeCommit()) {
       broadcastAppend(true);
@@ -862,6 +963,9 @@ public final class RaftNode {
   private void setMembership(Membership m, long index) {
     membership = m;
     configIndex = index;
+    if (transferee != null && !m.isVoter(transferee)) {
+      transferee = null;
+    }
     if (role == Role.LEADER) {
       progress.keySet().removeIf(n -> !m.isMember(n));
       for (NodeId n : m.members()) {

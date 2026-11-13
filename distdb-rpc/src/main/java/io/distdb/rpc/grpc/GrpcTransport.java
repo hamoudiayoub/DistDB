@@ -15,6 +15,7 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Function;
 
 /**
  * The production {@link Transport} for Raft: one long-lived gRPC stream to each peer, carrying
@@ -30,7 +31,7 @@ public final class GrpcTransport implements Transport, AutoCloseable {
   private static final System.Logger LOG = System.getLogger(GrpcTransport.class.getName());
 
   private final NodeId self;
-  private final Map<NodeId, String> addresses;
+  private final Function<NodeId, String> addresses;
   private final Map<NodeId, ManagedChannel> channels = new HashMap<>();
   private final Map<NodeId, StreamObserver<RaftFrame>> streams = new HashMap<>();
   private volatile MessageHandler handler;
@@ -40,8 +41,18 @@ public final class GrpcTransport implements Transport, AutoCloseable {
    * @param addresses {@code host:port} of every peer (this node may be included; it is ignored)
    */
   public GrpcTransport(NodeId self, Map<NodeId, String> addresses) {
+    this(self, Map.copyOf(addresses)::get);
+  }
+
+  /**
+   * @param self this node
+   * @param addresses looks up a peer's {@code host:port} when a stream to it is first opened; null
+   *     if unknown (the message is dropped). A sharded store learns addresses from the placement
+   *     driver as it goes.
+   */
+  public GrpcTransport(NodeId self, Function<NodeId, String> addresses) {
     this.self = Objects.requireNonNull(self);
-    this.addresses = Map.copyOf(addresses);
+    this.addresses = Objects.requireNonNull(addresses);
   }
 
   @Override
@@ -58,7 +69,7 @@ public final class GrpcTransport implements Transport, AutoCloseable {
   public synchronized void send(NodeId to, byte[] message) {
     StreamObserver<RaftFrame> stream = streams.get(to);
     if (stream == null) {
-      String address = addresses.get(to);
+      String address = addresses.apply(to);
       if (address == null) {
         return; // unknown peer: drop, as a network would
       }

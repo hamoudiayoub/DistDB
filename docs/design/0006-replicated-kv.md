@@ -3,6 +3,11 @@
 > Draft written while building Phase 5. The theme is "the gap between a consensus algorithm and
 > a usable service": Raft gives you a replicated log; everything in this note is what it takes to
 > turn that into a service whose clients can't tell it isn't one machine.
+>
+> **Since Phase 6:** data nodes run `Store`, which hosts many ranges, each a group like the one
+> described here; [0007](0007-sharding.md) explains what sharding changed. `ReplicatedKv` remains
+> for a single group, and it is what the placement driver's own group runs on. Its write path is
+> shared with the ranges (`KvWrites`), which added a conditional put.
 
 ## Problem
 

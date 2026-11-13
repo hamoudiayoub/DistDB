@@ -18,7 +18,20 @@ public final class Main {
         distdb node --data-dir DIR --id N --peers 1=HOST:PORT,2=HOST:PORT,3=HOST:PORT
             Run node N of a replicated group; it listens on its own entry in --peers.
 
-        distdb kv [--server HOST:PORT[,HOST:PORT...]] [--timeout DURATION] OPERATION
+      A sharded cluster: a placement driver of three nodes, and data nodes that it fills.
+
+        distdb pd --data-dir DIR --id N --peers 1=HOST:PORT,2=HOST:PORT,3=HOST:PORT
+                  [--split-keys N] [--dead-after DURATION]
+            Run node N of the placement driver; it listens on its own entry in --peers.
+
+        distdb node --data-dir DIR --id N --listen HOST:PORT --pd PD_ADDRESSES [--founders 1,2,3]
+            Run data node N. The founders create the first range when the cluster is new;
+            the placement driver then splits ranges and spreads them over all data nodes.
+
+        distdb ranges --pd PD_ADDRESSES
+            Print every range: its span, epoch, replicas and leader.
+
+        distdb kv [--server HOST:PORT[,HOST:PORT...] | --pd PD_ADDRESSES] [--timeout DURATION] OPERATION
             get KEY                         print the value (exit 1 if there is none)
             put KEY VALUE                   set KEY to VALUE
             delete KEY                      remove KEY
@@ -50,6 +63,8 @@ public final class Main {
       return switch (args.getFirst()) {
         case "node" -> NodeCommand.run(rest, out, err);
         case "kv" -> KvCommand.run(rest, out, err);
+        case "pd" -> ShardedCommands.pd(rest, out, err);
+        case "ranges" -> ShardedCommands.ranges(rest, out, err);
         default -> throw new Args.UsageException("unknown command " + args.getFirst());
       };
     } catch (Args.UsageException | IllegalArgumentException e) {

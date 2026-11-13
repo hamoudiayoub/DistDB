@@ -87,6 +87,34 @@ public final class RaftStore {
     return new PersistedState(hs, snapshot, entries);
   }
 
+  /**
+   * Adds to {@code batch} a fresh Raft state for a range created on this node (bootstrapped, or
+   * made by a split): hard state {@code hs}, snapshot {@code s}, and no log entries.
+   */
+  void initialize(WriteBatch batch, HardState hs, Snapshot s) {
+    deleteRange(batch, logKey(0), logEnd());
+    batch.put(snapshotKey(), RaftCodec.encodeSnapshot(s));
+    batch.put(hardStateKey(), RaftCodec.encodeHardState(hs));
+  }
+
+  /**
+   * Adds to {@code batch} the deletion of this group's log and snapshot. The term and vote stay
+   * (with commit 0): if the node is added back, it must not vote twice in a term it voted in.
+   */
+  void destroy(WriteBatch batch) {
+    deleteRange(batch, logKey(0), logEnd());
+    batch.delete(snapshotKey());
+    hardState()
+        .ifPresent(hs ->
+            batch.put(
+                hardStateKey(), RaftCodec.encodeHardState(new HardState(hs.term(), hs.vote(), 0))));
+  }
+
+  /** The stored hard state, if any. */
+  Optional<HardState> hardState() {
+    return engine.get(hardStateKey()).map(RaftCodec::decodeHardState);
+  }
+
   /** The stored entry at {@code index}, if any (for tests and debugging). */
   public Optional<Entry> entry(long index) {
     return engine.get(logKey(index)).map(RaftCodec::decodeEntry);

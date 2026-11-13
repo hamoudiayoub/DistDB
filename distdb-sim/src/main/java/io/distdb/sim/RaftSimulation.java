@@ -123,7 +123,8 @@ public final class RaftSimulation {
       long snapshotsInstalled,
       long configChanges,
       long messagesSent,
-      long messagesLost) {}
+      long messagesLost,
+      long leaderTransfers) {}
 
   private static final Duration TICK = Duration.ofMillis(10);
   private static final Path DIR = Path.of("/node");
@@ -151,6 +152,7 @@ public final class RaftSimulation {
   private long diskFailures;
   private long partitions;
   private long configChanges;
+  private long leaderTransfers;
   private long readSeq;
 
   private RaftSimulation(long seed, Options options) {
@@ -216,7 +218,8 @@ public final class RaftSimulation {
         checker.snapshotsInstalled,
         configChanges,
         s.sent,
-        s.dropped + s.cut);
+        s.dropped + s.cut,
+        leaderTransfers);
   }
 
   // -----------------------------------------------------------------------------------------------
@@ -315,6 +318,17 @@ public final class RaftSimulation {
     }
     RaftNode.Status s = leader.raft.status();
     Membership m = s.membership();
+    if (random.nextInt(3) == 0) {
+      // Hand the leadership to another voter, as a rebalancer does before moving a replica.
+      List<NodeId> others = new ArrayList<>(m.voters());
+      others.remove(leader.id);
+      if (!others.isEmpty()
+          && leader.raft.transferLeadership(others.get(random.nextInt(others.size())))) {
+        leaderTransfers++;
+        leader.drain();
+      }
+      return;
+    }
     List<ConfigChange> choices = new ArrayList<>();
     for (NodeId id : nodes.keySet()) {
       if (!m.isMember(id) && !retired.contains(id)) {

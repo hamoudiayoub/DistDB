@@ -14,8 +14,9 @@ placeholder name.)
 | 3     | Single-node KV server over gRPC, CLI client, safe retries    | done    |
 | 4     | Raft library and the deterministic simulator                 | done    |
 | 5     | Replicated KV service, linearizable, checked under faults    | done    |
-| 6     | Multi-Raft and sharding: ranges, placement driver, splits    | next    |
-| 7–10  | Transactions, SQL, distributed execution, hardening          | planned |
+| 6     | Multi-Raft and sharding: ranges, placement driver, splits    | done    |
+| 7     | Percolator transactions, snapshot isolation                  | next    |
+| 8–10  | SQL, distributed execution, hardening                        | planned |
 
 Phase 2's gate, run at full scale:
 
@@ -45,37 +46,67 @@ with three real processes over gRPC, killing the leader. CI runs 30 seeds; the g
 ./gradlew :distdb-sim:test --tests '*ReplicatedKvSimulationTest' -Ddistdb.sim.kvSeeds=500
 ```
 
+Phase 6's gate is `ShardedKvSimulationTest`. A placement driver of three nodes and four or five
+data nodes run under the same faults (and power cuts of the PD leader), while the PD splits and
+rebalances ranges and the run forces more splits and moves at random. The history must stay
+linearizable across every split and move, no write may take effect twice in any range, and at the
+end the ranges must tile the key space with identical replicas. `ShardedClusterTest` does it with
+seven real processes. CI runs 20 seeds; the gate is 500:
+
+```bash
+./gradlew :distdb-sim:test --tests '*ShardedKvSimulationTest' -Ddistdb.sim.shardSeeds=500
+```
+
 ## Try it
 
 ```bash
 ./gradlew :distdb-server:installDist
 ```
 
-A three-node cluster, one terminal per node:
+A sharded cluster: a placement driver (PD) of three nodes, then data nodes. One terminal per
+process. `--split-keys 50` makes the PD split ranges early, so you can watch it happen:
 
 ```bash
-distdb-server/build/install/distdb/bin/distdb node --data-dir /tmp/d1 --id 1 --peers 1=127.0.0.1:7701,2=127.0.0.1:7702,3=127.0.0.1:7703
+distdb-server/build/install/distdb/bin/distdb pd --data-dir /tmp/pd1 --id 1 --peers 1=127.0.0.1:7601,2=127.0.0.1:7602,3=127.0.0.1:7603 --split-keys 50
 ```
 ```bash
-distdb-server/build/install/distdb/bin/distdb node --data-dir /tmp/d2 --id 2 --peers 1=127.0.0.1:7701,2=127.0.0.1:7702,3=127.0.0.1:7703
+distdb-server/build/install/distdb/bin/distdb pd --data-dir /tmp/pd2 --id 2 --peers 1=127.0.0.1:7601,2=127.0.0.1:7602,3=127.0.0.1:7603 --split-keys 50
 ```
 ```bash
-distdb-server/build/install/distdb/bin/distdb node --data-dir /tmp/d3 --id 3 --peers 1=127.0.0.1:7701,2=127.0.0.1:7702,3=127.0.0.1:7703
+distdb-server/build/install/distdb/bin/distdb pd --data-dir /tmp/pd3 --id 3 --peers 1=127.0.0.1:7601,2=127.0.0.1:7602,3=127.0.0.1:7603 --split-keys 50
 ```
 
-Then talk to it through any node; the client follows redirects to the leader. Kill the leader's
-terminal and keep writing: after a short pause, another node takes over.
+Nodes 1 to 3 found the first range; node 4 starts empty, and the PD moves replicas onto it:
 
 ```bash
-distdb-server/build/install/distdb/bin/distdb kv --server 127.0.0.1:7701,127.0.0.1:7702,127.0.0.1:7703 put greeting "hello world"
+distdb-server/build/install/distdb/bin/distdb node --data-dir /tmp/n1 --id 1 --listen 127.0.0.1:7701 --pd 127.0.0.1:7601,127.0.0.1:7602,127.0.0.1:7603 --founders 1,2,3
 ```
 ```bash
-distdb-server/build/install/distdb/bin/distdb kv --server 127.0.0.1:7701,127.0.0.1:7702,127.0.0.1:7703 get greeting
+distdb-server/build/install/distdb/bin/distdb node --data-dir /tmp/n2 --id 2 --listen 127.0.0.1:7702 --pd 127.0.0.1:7601,127.0.0.1:7602,127.0.0.1:7603 --founders 1,2,3
+```
+```bash
+distdb-server/build/install/distdb/bin/distdb node --data-dir /tmp/n3 --id 3 --listen 127.0.0.1:7703 --pd 127.0.0.1:7601,127.0.0.1:7602,127.0.0.1:7603 --founders 1,2,3
+```
+```bash
+distdb-server/build/install/distdb/bin/distdb node --data-dir /tmp/n4 --id 4 --listen 127.0.0.1:7704 --pd 127.0.0.1:7601,127.0.0.1:7602,127.0.0.1:7603
 ```
 
-Without `--peers`, `distdb node --data-dir DIR` is a group of one on `127.0.0.1:7700`. There is no
-authentication, so keep nodes on localhost. The `distdb` script runs the JDK in `JAVA_HOME`, which
-must be 25. The CLI's exit status tells a failed write (3) from one that may have been applied (4).
+The client asks the PD where each key lives. Write some keys, then list the ranges:
+
+```bash
+distdb-server/build/install/distdb/bin/distdb kv --pd 127.0.0.1:7601,127.0.0.1:7602,127.0.0.1:7603 put greeting "hello world"
+```
+```bash
+distdb-server/build/install/distdb/bin/distdb ranges --pd 127.0.0.1:7601,127.0.0.1:7602,127.0.0.1:7603
+```
+
+Kill any one node, PD or data, and the cluster keeps serving. A single replicated group without a
+PD still works as in Phase 5: `distdb node --data-dir DIR --id N --peers 1=HOST:PORT,...`, used
+with `distdb kv --server ...`; and without `--peers` a node is a group of one on `127.0.0.1:7700`.
+
+There is no authentication, so keep nodes on localhost. The `distdb` script runs the JDK in
+`JAVA_HOME`, which must be 25. The CLI's exit status tells a failed write (3) from one that may have
+been applied (4).
 
 ## Build
 
@@ -100,15 +131,15 @@ distdb-common   byte-comparable key encoding, ids
 distdb-env      Clock, RandomSource, Transport, FileSystem, Scheduler + real implementations
 distdb-storage  LSM engine                                  (Phase 2)
 distdb-raft     Raft as a pure state machine, no I/O        (Phase 4)
-distdb-rpc      protos, KvChannel/KvHandler, gRPC transports (Phases 3, 5)
-distdb-kv       ReplicatedKv, KvStateMachine, RaftStore     (Phases 3-5)
-distdb-pd       placement driver and TSO                    (Phase 6)
-distdb-client   KvClient: deadlines, retries, redirects     (Phases 3, 5)
+distdb-rpc      protos, KvChannel/KvHandler, PdClient, gRPC (Phases 3, 5, 6)
+distdb-kv       Store (many ranges), ReplicatedKv, RaftStore (Phases 3-6)
+distdb-pd       placement driver; the TSO joins in Phase 7  (Phase 6)
+distdb-client   KvClient: retries, redirects, range cache   (Phases 3, 5, 6)
 distdb-txn      Percolator transactions                     (Phase 7)
 distdb-sql      parser, planner, executor                   (Phases 8-9)
 distdb-pgwire   PostgreSQL wire protocol                    (Phase 8)
-distdb-server   the distdb binary: node, kv                 (Phases 3, 10)
-distdb-sim      simulations, safety and linearizability checks (Phases 4-5)
+distdb-server   the distdb binary: node, pd, kv, ranges     (Phases 3, 6, 10)
+distdb-sim      simulations, safety and linearizability checks (Phases 4-6)
 distdb-bench    benchmarks                                  (Phase 10)
 docs/design/    one design note per component
 docs/journal.md learning journal

@@ -89,7 +89,7 @@ final class ArchitectureRules {
           .whereLayer("kv")
           .mayOnlyAccessLayers("storage", "raft", "rpc", "env", "common")
           .whereLayer("pd")
-          .mayOnlyAccessLayers("storage", "raft", "rpc", "env", "common")
+          .mayOnlyAccessLayers("kv", "client", "storage", "raft", "rpc", "env", "common")
           .whereLayer("client")
           .mayOnlyAccessLayers("rpc", "env", "common")
           .whereLayer("txn")

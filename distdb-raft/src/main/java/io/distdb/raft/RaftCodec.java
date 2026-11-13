@@ -25,6 +25,7 @@ public final class RaftCodec {
   private static final byte HEARTBEAT = 5;
   private static final byte HEARTBEAT_RESPONSE = 6;
   private static final byte INSTALL_SNAPSHOT = 7;
+  private static final byte TIMEOUT_NOW = 8;
 
   private RaftCodec() {}
 
@@ -39,6 +40,7 @@ public final class RaftCodec {
           out.writeLong(v.lastIndex());
           out.writeLong(v.lastTerm());
           out.writeBoolean(v.preVote());
+          out.writeBoolean(v.transfer());
         }
         case Message.VoteResponse v -> {
           header(out, VOTE_RESPONSE, m);
@@ -75,6 +77,7 @@ public final class RaftCodec {
           header(out, INSTALL_SNAPSHOT, m);
           writeSnapshot(out, s.snapshot());
         }
+        case Message.TimeoutNow t -> header(out, TIMEOUT_NOW, m);
       }
     });
   }
@@ -95,7 +98,13 @@ public final class RaftCodec {
           return switch (type) {
             case REQUEST_VOTE ->
                 new Message.RequestVote(
-                    from, to, term, in.readLong(), in.readLong(), in.readBoolean());
+                    from,
+                    to,
+                    term,
+                    in.readLong(),
+                    in.readLong(),
+                    in.readBoolean(),
+                    in.readBoolean());
             case VOTE_RESPONSE ->
                 new Message.VoteResponse(from, to, term, in.readBoolean(), in.readBoolean());
             case APPEND_ENTRIES -> {
@@ -115,6 +124,7 @@ public final class RaftCodec {
             case HEARTBEAT -> new Message.Heartbeat(from, to, term, in.readLong(), in.readLong());
             case HEARTBEAT_RESPONSE -> new Message.HeartbeatResponse(from, to, term, in.readLong());
             case INSTALL_SNAPSHOT -> new Message.InstallSnapshot(from, to, term, readSnapshot(in));
+            case TIMEOUT_NOW -> new Message.TimeoutNow(from, to, term);
             default -> throw new IllegalArgumentException("unknown message type " + type);
           };
         });

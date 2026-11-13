@@ -15,7 +15,8 @@ public sealed interface Message
         Message.AppendResponse,
         Message.Heartbeat,
         Message.HeartbeatResponse,
-        Message.InstallSnapshot {
+        Message.InstallSnapshot,
+        Message.TimeoutNow {
 
   NodeId from();
 
@@ -26,10 +27,17 @@ public sealed interface Message
   /**
    * "Vote for me in {@code term}." With {@code preVote}, it is only a question ("would you?") asked
    * for {@code term} without the sender having moved to it, so a node cut off from the group cannot
-   * push everyone's term up while it fails to win.
+   * push everyone's term up while it fails to win. With {@code transfer}, the leader asked for this
+   * election ({@link TimeoutNow}), so voters grant it even while they still hear from that leader.
    */
   record RequestVote(
-      NodeId from, NodeId to, long term, long lastIndex, long lastTerm, boolean preVote)
+      NodeId from,
+      NodeId to,
+      long term,
+      long lastIndex,
+      long lastTerm,
+      boolean preVote,
+      boolean transfer)
       implements Message {}
 
   /** The answer to a {@link RequestVote}. */
@@ -84,4 +92,10 @@ public sealed interface Message
 
   /** "Replace your log with this state." Sent when the entries a follower needs are compacted. */
   record InstallSnapshot(NodeId from, NodeId to, long term, Snapshot snapshot) implements Message {}
+
+  /**
+   * "Start an election now." A leader sends it to hand over its leadership (thesis 3.10), once the
+   * target's log is as complete as its own, so the target wins at once.
+   */
+  record TimeoutNow(NodeId from, NodeId to, long term) implements Message {}
 }

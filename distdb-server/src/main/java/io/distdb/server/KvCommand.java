@@ -7,6 +7,7 @@ import io.distdb.client.KvException;
 import io.distdb.env.ExecutorScheduler;
 import io.distdb.env.SplittableRandomSource;
 import io.distdb.env.SystemClock;
+import io.distdb.rpc.PdClient;
 import io.distdb.rpc.grpc.GrpcKvChannel;
 import java.io.PrintStream;
 import java.time.Duration;
@@ -27,7 +28,8 @@ final class KvCommand {
   private KvCommand() {}
 
   static int run(List<String> argv, PrintStream out, PrintStream err) throws Args.UsageException {
-    Args args = Args.parse(argv, Set.of("server", "timeout", "limit"));
+    Args args = Args.parse(argv, Set.of("server", "pd", "timeout", "limit"));
+    String pd = args.option("pd", null);
     String server = args.option("server", NodeCommand.DEFAULT_LISTEN);
     Duration timeout = Args.duration(args.option("timeout", "5s"));
     List<String> p = args.positional();
@@ -76,17 +78,25 @@ final class KvCommand {
           default -> throw new Args.UsageException("unknown operation " + op);
         };
 
-    // Any member will do: the client follows redirects to the leader.
-    List<String> seeds = List.of(server.split(","));
+    // With --pd, the client asks the placement driver where each key lives. With --server, any
+    // member will do: the client follows redirects to the leader.
     try (ExecutorScheduler scheduler = new ExecutorScheduler();
         KvClient client =
-            new KvClient(
-                seeds,
-                GrpcKvChannel::connect,
-                SystemClock.INSTANCE,
-                scheduler,
-                SplittableRandomSource.fromEntropy(),
-                ClientOptions.defaults().withDefaultTimeout(timeout))) {
+            pd != null
+                ? new KvClient(
+                    new PdClient(List.of(pd.split(",")), GrpcKvChannel::connect),
+                    GrpcKvChannel::connect,
+                    SystemClock.INSTANCE,
+                    scheduler,
+                    SplittableRandomSource.fromEntropy(),
+                    ClientOptions.defaults().withDefaultTimeout(timeout))
+                : new KvClient(
+                    List.of(server.split(",")),
+                    GrpcKvChannel::connect,
+                    SystemClock.INSTANCE,
+                    scheduler,
+                    SplittableRandomSource.fromEntropy(),
+                    ClientOptions.defaults().withDefaultTimeout(timeout))) {
       return operation.run(client);
     } catch (KvException e) {
       err.println("error: " + e.getMessage());

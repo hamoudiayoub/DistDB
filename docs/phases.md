@@ -6,7 +6,7 @@ ranges, and any node answers SQL from `psql`. It is built bottom-up in ten phase
 ends at a **gate**, a test that proves it works, and leaves a design note in `docs/design/`.
 
 This document explains what each phase does, how it works, and what to learn from it.
-**Phases 1–5 are built** (with their measured results); **phases 6–10 are the plan.**
+**Phases 1–6 are built** (with their measured results); **phases 7–10 are the plan.**
 
 ```
  SQL (8, 9)      psql ─▶ pgwire ─▶ parser ─▶ planner ─▶ distributed executor
@@ -272,39 +272,92 @@ disk failures and 2,897 partitions.
 
 ---
 
-## Phase 6: Multi-Raft and sharding *(planned)*
+## Phase 6: Multi-Raft and sharding
 
 **Goal.** Scale out. Cut the key space into **ranges** `[start, end)`, each its own Raft group of
-three replicas, with thousands of ranges per node. Ranges split as they grow and move to balance
-load.
+three replicas, many ranges per node. Ranges split as they grow and move to balance the load,
+while clients keep reading and writing without noticing anything but a little latency.
 
-**What it will build.**
-- **Range descriptors:** range id, start and end key, replicas, and an **epoch** made of two
-  counters, one bumped on split or merge and one on membership change. Every request carries the
-  epoch it was routed with; a stale one gets `EpochMismatch`. A request for a key that isn't here
-  gets `RangeNotFound`.
-- **A multi-Raft host:** one node runs many `RaftNode`s that share one engine and one transport.
-  Messages carry a range id, and messages for many ranges to the same peer are batched into one
-  RPC per tick. Raft state, the applied index and client sessions become per range. Each state
-  machine sees only its key span, and snapshots cover only that span.
-- **The placement driver (PD):** three processes forming their own Raft group (reusing the
-  Phase 4 library). It holds the range directory and current leaders, and tracks node liveness
-  from heartbeats. Its scheduler emits operations: add replica, remove replica, transfer leader,
-  split.
-- **Routing:** each client keeps a range cache (key → range → leader). On a miss, `NotLeader` or
-  `EpochMismatch`, it asks the PD and retries.
-- **Splits:** when a range is too big, its leader picks a middle key and proposes a split command.
-  Every replica applies it at the same log index, creating the right-hand range with the same
-  members. Making this atomic across crashes is one of the hardest parts of the project.
-- **Rebalancing:** move a replica by adding a learner, letting it catch up, promoting it, then
-  removing the old one. This needs leadership transfer (a `TimeoutNow` message in Raft).
+**What it builds.**
+- **Range descriptors:** range id, span, voters, learners, and an **epoch** of two counters:
+  `version` (bumped by a split) and `conf_ver` (the log index of the last membership change).
+  Requests carry the range id and version they were routed with; a node answers `RangeNotFound`
+  or `EpochMismatch` when the client's picture is stale.
+- **`Store`, a multi-Raft host:** one node runs many `RaftNode`s in one mailbox, over one LSM
+  engine. Each range has its own Raft log, applied index and client sessions, and its state
+  machine (`RangeStateMachine`) touches only its own span. Raft messages for many ranges to the
+  same peer leave as one frame per round.
+- **Splits through the log.** The leader proposes `Split(key, new id, expected version)`. Every
+  replica applies it at the same index, in one atomic batch: the left range narrows, the right
+  range is created with a copy of the client sessions and a fresh Raft state starting at index 5.
+- **Replica lifecycle.** A message for an unknown range creates an uninitialized replica (how a
+  node joins a range). A removed replica is never told by Raft, so members answer its messages
+  with a `Removed` notice, and it destroys itself, keeping its term and vote and a tombstone.
+- **Leadership transfer** in the Raft library (`TimeoutNow`), so a replica that must leave hands
+  its leadership over first.
+- **The placement driver (PD):** three processes running a Phase 5 `ReplicatedKv` group. It
+  allocates range ids (conditional puts on a replicated counter), learns the directory and store
+  liveness from heartbeats, and schedules operators: repair, add or remove replicas, split, move
+  replicas for balance, transfer leaders.
+- **Routing:** `KvClient` keeps a range cache (key → range → leader), asks the PD on a miss, and
+  drops an entry on `RangeNotFound` or `EpochMismatch`. A scan walks the ranges in order.
+- **Commands:** `distdb pd`, `distdb node --pd ... --founders ...`, `distdb ranges`, and
+  `distdb kv --pd ...`.
 
-**Concepts to learn.** Range vs hash partitioning; hot spots; metadata management; cache
-invalidation by epochs; operating thousands of state machines per node; atomic splits; placement
-and failure detection. *Read:* Kleppmann's DDIA chapters 5–6, and the TiKV multi-Raft documents.
+**How it works, in one example.** Range 1 `[−∞, +∞)` lives on nodes 1, 2, 3. It grows past the
+PD's limit, so the PD sends its leader `Split(r1, new id 7)`. The leader picks the middle key `m`
+and proposes the split. Every replica applies it at, say, index 412: r1 becomes `[−∞, m)` at
+version 2, and r7 `[m, +∞)` appears on all three nodes, with r1's sessions copied. r1's leader
+campaigns for r7 at once. Later the PD sees node 4 empty and moves r7's replica from node 1 to node
+4: add node 4 as a learner, which catches up from a snapshot; promote it; remove node 1 (handing
+over the leadership first if node 1 led). Node 1 is not told; the next time it campaigns for r7, a
+member answers `Removed`, and node 1 deletes its copy. Meanwhile a client that still routes key
+`q` to r1 gets `EpochMismatch`, asks the PD, and goes to r7.
 
-**Gate.** Data keeps flowing while ranges split and move under faults, and the linearizability
-checker still passes. **Milestone:** a sharded, replicated KV store.
+**Concepts to learn.** Range vs hash partitioning; hot spots; metadata that is a cache, and
+epochs to tell it is stale; why splits must go through the log and be atomic; why a node may only
+create or keep a replica it is a member of; why destroying a replica must keep its vote; why a
+snapshot is "state as of an index"; leader leases vs leadership transfer; failure detection and
+placement. *Read:* Kleppmann's DDIA chapters 5–6, the TiKV deep-dive on multi-Raft, CockroachDB's
+range splits and replica GC.
+
+**How it's tested.**
+- **`ShardedKvSimulation` (the gate):** a 3-node PD and 4 or 5 data nodes, real stores on simulated
+  disks, real routed clients. Faults: partitions that also cut clients and PD nodes, power cuts
+  (also of the PD leader), disk failures, stalled clocks, peer-only partitions. On top, the run
+  forces random splits and random replica moves. Afterwards: the history is linearizable per key;
+  no write took effect twice (in any range); acknowledged writes took effect and "certainly failed"
+  ones did not; every client made progress after the faults; the ranges tile the key space; every
+  member of every range has the same descriptor and data; no node ever held overlapping replicas
+  (checked every 100 ms during the run).
+- **Unit tests:** `RangeStateMachineTest` (each split rule), `StoreTest` (routing, a split across
+  three stores, a retry after a split, a move with removal and re-add, a leader asked to remove
+  itself), and Raft tests for leadership transfer and for a learner that lost its log.
+- **`ShardedClusterTest`:** seven real processes; the PD splits and spreads the ranges, a data
+  node is killed, and every acknowledged write reads back.
+
+**Gate.** **500 seeds:** 426,071 operations, all linearizable, while ranges split 5,144 times and
+changed membership 123,400 times (31,559 replicas destroyed), through 2,641 power cuts (617 of
+the PD leader), 1,280 disk failures and 2,699 partitions.
+- With seven real processes, the PD split the first range into four and moved replicas onto the
+  fourth node within seconds. Killing a data node lost no acknowledged write.
+- Of ten bugs planted on purpose, five were caught by the simulation and four more by targeted
+  unit tests. The last is a check that cannot fail today, and is kept as a safeguard.
+
+*Passed.* (This phase is not committed yet.)
+
+**The hardest bug.** A node removed from a range and added back had lost its log, and it voted
+for a candidate that was still using a configuration from before the removal. That elected a
+leader without entries the node had once acknowledged: two different committed entries at one
+index. The fix: a replica created again does not vote until its log is as long as it was.
+
+**Lessons.**
+- A snapshot is the state at some index, with that index's span; a snapshot from before a split
+  can never be installed next to the ranges the split created.
+- A host that destroys replicas breaks an assumption Raft makes (followers never lose
+  acknowledged entries). The host must make up for it, or teach Raft the new case.
+- The PD is a cache with opinions. Nothing it says is trusted for safety; ranges check every
+  operator against their own state.
 
 ---
 

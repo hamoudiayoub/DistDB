@@ -132,6 +132,7 @@ public final class ReplicatedKv implements KvHandler, AutoCloseable {
   private int ticksSinceSweep;
   private volatile boolean stopped;
   private volatile Throwable failure;
+  private volatile RaftNode.Status published; // for readers on other threads
 
   private static final class PendingRead {
     final KvRequest request;
@@ -180,6 +181,7 @@ public final class ReplicatedKv implements KvHandler, AutoCloseable {
     } else {
       this.raft = RaftNode.restart(config.raft(), state, machine.appliedIndex(), random);
     }
+    this.published = raft.status();
   }
 
   /** Starts receiving peer messages and ticking. */
@@ -215,7 +217,7 @@ public final class ReplicatedKv implements KvHandler, AutoCloseable {
       result.complete(KvErrors.deadlineExceeded("deadline passed before the request was handled"));
       return;
     }
-    boolean write = request.hasPut() || request.hasDelete();
+    boolean write = KvRequests.isWrite(request);
     try {
       if (write) {
         KvRequests.validateWrite(request, config.kv());
@@ -425,6 +427,7 @@ public final class ReplicatedKv implements KvHandler, AutoCloseable {
       while ((task = mailbox.poll()) != null) {
         try {
           task.run();
+          published = raft.status();
         } catch (StorageException e) {
           failStop(e);
         } catch (RuntimeException e) {
@@ -458,9 +461,12 @@ public final class ReplicatedKv implements KvHandler, AutoCloseable {
 
   // -----------------------------------------------------------------------------------------------
 
-  /** A snapshot of the Raft state, for tests, debugging and the simulator. */
+  /**
+   * A snapshot of the Raft state as of the last task this replica ran; safe to call from any thread
+   * (the placement driver asks it whether it leads).
+   */
   public RaftNode.Status raftStatus() {
-    return raft.status();
+    return published;
   }
 
   /** Stops ticking and receiving. The engine is the caller's to close, after this. */

@@ -1,0 +1,118 @@
+// Ranges, and what stores and clients say to the placement driver (PD).
+//
+// PD requests travel inside the Kv service's KvRequest (op `pd`), so they share its deadlines,
+// channels and error handling. Only the PD's Raft leader answers them; the others say NotLeader.
+syntax = "proto3";
+
+package distdb.kv.v1;
+
+option java_package = "io.distdb.rpc.proto";
+option java_multiple_files = true;
+option java_outer_classname = "PdProto";
+
+// One range: a span of client keys, replicated by its own Raft group.
+message RangeDescriptor {
+  uint64 range_id = 1;
+  // Inclusive. Empty is the start of the key space.
+  bytes start_key = 2;
+  // Exclusive. Absent means no upper bound.
+  optional bytes end_key = 3;
+  repeated uint32 voters = 4;
+  repeated uint32 learners = 5;
+  // The epoch. conf_ver is the log index of the entry that last changed the replicas (or the
+  // range's first index); version goes up by one at every split.
+  uint64 conf_ver = 6;
+  uint64 version = 7;
+}
+
+message PdRequest {
+  oneof kind {
+    StoreHeartbeat heartbeat = 1;
+    LocateRequest locate = 2;
+    ListRangesRequest list_ranges = 3;
+  }
+}
+
+message PdResponse {
+  oneof kind {
+    StoreHeartbeatResponse heartbeat = 1;
+    LocateResponse locate = 2;
+    ListRangesResponse list_ranges = 3;
+  }
+}
+
+// Sent by every store each interval, and at once after a split or a membership change.
+message StoreHeartbeat {
+  uint32 store_id = 1;
+  string address = 2;
+  // A report for each range this store leads.
+  repeated RangeReport ranges = 3;
+  uint32 replica_count = 4;
+}
+
+message RangeReport {
+  RangeDescriptor desc = 1;
+  uint64 term = 2;
+  uint64 commit = 3;
+  // How far each other replica's log matches the leader's.
+  repeated ReplicaProgress progress = 4;
+  uint64 key_count = 5;
+}
+
+message ReplicaProgress {
+  uint32 node = 1;
+  uint64 match = 2;
+}
+
+message StoreHeartbeatResponse {
+  // Every store the PD knows: id -> address.
+  map<uint32, string> stores = 1;
+  // What the PD wants done to ranges this store leads. Suggestions: the range's leader checks
+  // each one and turns it into a Raft proposal, or ignores it.
+  repeated Operator operators = 2;
+}
+
+message Operator {
+  uint64 range_id = 1;
+  oneof kind {
+    uint32 add_learner = 2;
+    uint32 promote = 3;
+    uint32 remove = 4;
+    uint32 transfer_leader = 5;
+    SplitOperator split = 6;
+  }
+}
+
+message SplitOperator {
+  // Empty: the leader picks the middle key.
+  bytes split_key = 1;
+  // Allocated by the PD, never used for any other range.
+  uint64 new_range_id = 2;
+  // Ignored unless the range still has this version.
+  uint64 expected_version = 3;
+}
+
+message LocateRequest {
+  bytes key = 1;
+}
+
+message LocateResponse {
+  // False if the PD knows no range holding the key yet (right after a PD failover, say).
+  bool found = 1;
+  RangeInfo range = 2;
+  // Addresses of the range's replicas.
+  map<uint32, string> addresses = 3;
+}
+
+message RangeInfo {
+  RangeDescriptor desc = 1;
+  // The store the PD last heard lead it; 0 if none.
+  uint32 leader = 2;
+}
+
+message ListRangesRequest {}
+
+message ListRangesResponse {
+  repeated RangeInfo ranges = 1;
+  map<uint32, string> stores = 2;
+}

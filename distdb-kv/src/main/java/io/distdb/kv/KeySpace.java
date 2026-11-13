@@ -36,6 +36,15 @@ public final class KeySpace {
   /** {@code 'A' group}: the index of the last log entry applied to the data. */
   static final byte APPLIED = 'A';
 
+  /** {@code 'D' range}: a range's descriptor (replicated). */
+  static final byte DESCRIPTOR = 'D';
+
+  /**
+   * {@code 'T' range}: left when a replica is destroyed: the conf_ver of the configuration that
+   * removed this node. Messages from configurations at or below it are stale.
+   */
+  static final byte TOMBSTONE = 'T';
+
   /**
    * The ranges of the replicated state machine: client data, plus client sessions and their results
    * ({@code 'r'} and {@code 's'} are adjacent). Everything else in the local space (Raft logs, the

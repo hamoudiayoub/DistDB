@@ -7,6 +7,8 @@ syntax = "proto3";
 
 package distdb.kv.v1;
 
+import "distdb/kv/v1/pd.proto";
+
 option java_package = "io.distdb.rpc.proto";
 option java_multiple_files = true;
 option java_outer_classname = "KvProto";
@@ -30,13 +32,24 @@ message KvRequest {
   // On writes: the lowest seq this client is still waiting for. Every seq below it has its
   // answer, so the server may forget those results and must reject any late copy of them.
   uint64 first_incomplete_seq = 2;
+  // Which range the client routed this to, and the version of its descriptor then. Absent: the
+  // node finds the range holding the key among its own replicas.
+  RangeHeader header = 3;
 
   oneof op {
     GetRequest get = 10;
     PutRequest put = 11;
     DeleteRequest delete = 12;
     ScanRequest scan = 13;
+    ConditionalPutRequest cput = 14;
+    // For the placement driver; see pd.proto.
+    PdRequest pd = 20;
   }
+}
+
+message RangeHeader {
+  uint64 range_id = 1;
+  uint64 version = 2;
 }
 
 message GetRequest {
@@ -69,6 +82,8 @@ message KvResponse {
     PutResponse put = 11;
     DeleteResponse delete = 12;
     ScanResponse scan = 13;
+    ConditionalPutResponse cput = 14;
+    PdResponse pd = 20;
   }
 }
 
@@ -87,6 +102,19 @@ message ScanResponse {
   optional bytes resume_key = 2;
 }
 
+// Sets key to value only if its current value is expected (absent expected: only if it has none).
+message ConditionalPutRequest {
+  bytes key = 1;
+  bytes value = 2;
+  optional bytes expected = 3;
+}
+
+message ConditionalPutResponse {
+  bool succeeded = 1;
+  // If it did not: the value found, absent if none.
+  optional bytes actual = 2;
+}
+
 message KeyValue {
   bytes key = 1;
   bytes value = 2;
@@ -94,7 +122,7 @@ message KeyValue {
 
 // Errors the server decided on. Each kind tells the client exactly what to do next, which is why
 // they are typed rather than strings. Apart from StorageFailure.maybe_applied, this attempt
-// changed nothing. (NotLeader, RangeNotFound, EpochMismatch and KeyLocked join in Phases 5 to 7.)
+// changed nothing. (KeyLocked joins in Phase 7.)
 message Error {
   oneof kind {
     // Too many requests in flight. Retry after a backoff.
@@ -110,6 +138,11 @@ message Error {
     StaleRequest stale_request = 5;
     // This node is not the Raft leader. Retry at the leader it names, or at another node.
     NotLeader not_leader = 6;
+    // This node has no replica of the range the request names. Ask the PD where it is.
+    RangeNotFound range_not_found = 7;
+    // The range changed (it split, so the key may be elsewhere) since the client looked it up.
+    // Ask the PD again.
+    EpochMismatch epoch_mismatch = 8;
   }
   string message = 15;
 }
@@ -136,3 +169,7 @@ message StorageFailure {
 }
 
 message StaleRequest {}
+
+message RangeNotFound {}
+
+message EpochMismatch {}

@@ -16,7 +16,17 @@ message Command {
   oneof kind {
     WriteCommand write = 1;
     ExpireSessions expire_sessions = 2;
+    SplitCommand split = 3;
   }
+}
+
+// Split the range at split_key: it keeps [start, split_key), and a new range new_range_id gets
+// [split_key, end) with the same replicas. Every replica applies it at the same log index, in one
+// atomic batch. Ignored unless the range still has expected_version and split_key is inside it.
+message SplitCommand {
+  bytes split_key = 1;
+  uint64 new_range_id = 2;
+  uint64 expected_version = 3;
 }
 
 message WriteCommand {

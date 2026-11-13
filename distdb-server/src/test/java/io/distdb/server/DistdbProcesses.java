@@ -78,7 +78,16 @@ final class DistdbProcesses {
 
   /** Starts {@code distdb node <args>} and waits until it prints its address. */
   NodeProcess node(String... args) throws Exception {
-    List<String> argv = new ArrayList<>(List.of("node"));
+    return start("node", args);
+  }
+
+  /** Starts {@code distdb pd <args>} (a placement driver node) and waits until it listens. */
+  NodeProcess pd(String... args) throws Exception {
+    return start("pd", args);
+  }
+
+  private NodeProcess start(String command, String... args) throws Exception {
+    List<String> argv = new ArrayList<>(List.of(command));
     argv.addAll(List.of(args));
     Process p = java(argv.toArray(String[]::new));
     LinkedBlockingQueue<String> lines = new LinkedBlockingQueue<>();

@@ -40,11 +40,13 @@ final class NodeCommand {
 
   private NodeCommand() {}
 
-  static int run(List<String> argv, PrintStream out, PrintStream err)
-      throws Args.UsageException, IOException, InterruptedException {
-    Args args = Args.parse(argv, Set.of("data-dir", "listen", "id", "peers"));
+  static int run(List<String> argv, PrintStream out, PrintStream err) throws Exception {
+    Args args = Args.parse(argv, Set.of("data-dir", "listen", "id", "peers", "pd", "founders"));
     if (!args.positional().isEmpty()) {
       throw new Args.UsageException("unexpected argument " + args.positional().getFirst());
+    }
+    if (args.option("pd", null) != null) {
+      return ShardedCommands.node(args, out, err); // a data node of a sharded cluster
     }
     Path dataDir = Path.of(args.required("data-dir")).toAbsolutePath();
     NodeId self = nodeId(args.option("id", "1"));
@@ -165,7 +167,7 @@ final class NodeCommand {
     return peers;
   }
 
-  private static NodeId nodeId(String text) throws Args.UsageException {
+  static NodeId nodeId(String text) throws Args.UsageException {
     try {
       return new NodeId(Integer.parseInt(text));
     } catch (IllegalArgumentException e) {

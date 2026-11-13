@@ -5,7 +5,9 @@ import io.distdb.env.Clock;
 import io.distdb.env.RandomSource;
 import io.distdb.env.Scheduler;
 import io.distdb.rpc.KvChannel;
+import io.distdb.rpc.PdClient;
 import io.distdb.rpc.RpcException;
+import io.distdb.rpc.proto.ConditionalPutRequest;
 import io.distdb.rpc.proto.DeleteRequest;
 import io.distdb.rpc.proto.Error;
 import io.distdb.rpc.proto.GetRequest;
@@ -13,7 +15,10 @@ import io.distdb.rpc.proto.GetResponse;
 import io.distdb.rpc.proto.KeyValue;
 import io.distdb.rpc.proto.KvRequest;
 import io.distdb.rpc.proto.KvResponse;
+import io.distdb.rpc.proto.LocateRequest;
+import io.distdb.rpc.proto.PdRequest;
 import io.distdb.rpc.proto.PutRequest;
+import io.distdb.rpc.proto.RangeHeader;
 import io.distdb.rpc.proto.RequestId;
 import io.distdb.rpc.proto.ScanRequest;
 import io.distdb.rpc.proto.ScanResponse;
@@ -61,6 +66,8 @@ public final class KvClient implements AutoCloseable {
   private final RandomSource random; // guarded by itself
   private final ClientOptions options;
   private final ByteString clientId;
+  private final PdClient pd; // null: no range routing, send to the target and follow redirects
+  private final RangeCache cache = new RangeCache();
 
   private final Object seqLock = new Object();
   private long nextSeq = 1; // guarded by seqLock
@@ -73,7 +80,7 @@ public final class KvClient implements AutoCloseable {
       Scheduler scheduler,
       RandomSource random,
       ClientOptions options) {
-    this(List.of("node"), address -> channel, false, clock, scheduler, random, options);
+    this(List.of("node"), address -> channel, false, null, clock, scheduler, random, options);
   }
 
   /**
@@ -89,13 +96,39 @@ public final class KvClient implements AutoCloseable {
       Scheduler scheduler,
       RandomSource random,
       ClientOptions options) {
-    this(seeds, connect, true, clock, scheduler, random, options);
+    this(seeds, connect, true, null, clock, scheduler, random, options);
+  }
+
+  /**
+   * A client of a sharded cluster: it asks the placement driver where each key lives, caches the
+   * answer, and sends each request to the leader of the range holding its key.
+   *
+   * @param pd the placement driver
+   * @param connect opens a channel to a node's address
+   */
+  public KvClient(
+      PdClient pd,
+      Function<String, KvChannel> connect,
+      Clock clock,
+      Scheduler scheduler,
+      RandomSource random,
+      ClientOptions options) {
+    this(
+        List.of("pd"),
+        connect,
+        true,
+        Objects.requireNonNull(pd),
+        clock,
+        scheduler,
+        random,
+        options);
   }
 
   private KvClient(
       List<String> seeds,
       Function<String, KvChannel> connect,
       boolean ownsChannels,
+      PdClient pd,
       Clock clock,
       Scheduler scheduler,
       RandomSource random,
@@ -106,6 +139,7 @@ public final class KvClient implements AutoCloseable {
     this.seeds = List.copyOf(seeds);
     this.connect = Objects.requireNonNull(connect);
     this.ownsChannels = ownsChannels;
+    this.pd = pd;
     this.target = this.seeds.getFirst();
     this.clock = Objects.requireNonNull(clock);
     this.scheduler = Objects.requireNonNull(scheduler);
@@ -179,6 +213,20 @@ public final class KvClient implements AutoCloseable {
             .setPut(PutRequest.newBuilder().setKey(bytes(key)).setValue(bytes(value)));
     return write(request, deadline(timeout))
         .thenApply(response -> expectVoid(response, KvResponse.ResultCase.PUT));
+  }
+
+  /**
+   * Sets {@code key} to {@code value} only if its current value is {@code expected} (empty: only if
+   * it has none). Completes with whether it did.
+   */
+  public CompletableFuture<Boolean> conditionalPut(
+      byte[] key, byte[] value, Optional<byte[]> expected, Duration timeout) {
+    ConditionalPutRequest.Builder cput =
+        ConditionalPutRequest.newBuilder().setKey(bytes(key)).setValue(bytes(value));
+    expected.ifPresent(e -> cput.setExpected(bytes(e)));
+    return write(KvRequest.newBuilder().setCput(cput), deadline(timeout))
+        .thenApply(
+            response -> expect(response, KvResponse.ResultCase.CPUT).getCput().getSucceeded());
   }
 
   /** Removes {@code key}; succeeds whether or not it existed. */
@@ -319,20 +367,85 @@ public final class KvClient implements AutoCloseable {
         return;
       }
       attempts++;
+      if (pd == null) {
+        send(target, null);
+        return;
+      }
+      byte[] key = routingKey(request);
+      RangeCache.Route cached = cache.lookup(key);
+      if (cached != null) {
+        send(cache.address(cached), cached);
+        return;
+      }
+      // Not cached: ask the placement driver where the key lives.
+      PdRequest locate =
+          PdRequest.newBuilder()
+              .setLocate(LocateRequest.newBuilder().setKey(ByteString.copyFrom(key)))
+              .build();
+      Duration timeout = Duration.ofNanos(Math.min(remaining, options.attemptTimeout().toNanos()));
+      pd.call(locate, timeout)
+          .whenComplete((response, failure) -> {
+            if (response != null && response.hasLocate() && response.getLocate().getFound()) {
+              RangeCache.Route route = cache.put(response.getLocate());
+              send(cache.address(route), route);
+            } else {
+              lastFailure =
+                  "cannot locate the key: "
+                      + (failure != null ? failure.getMessage() : "the PD knows no range for it");
+              retryLater();
+            }
+          });
+    }
+
+    /** Sends one attempt to {@code address}; {@code route} is the range it is meant for, if any. */
+    private void send(String address, RangeCache.Route route) {
+      long remaining = deadline - clock.nanoTime();
+      if (remaining <= 0) {
+        giveUp();
+        return;
+      }
+      if (address == null) {
+        cache.invalidate(route); // no known replica address: ask the PD again
+        lastFailure = "no address for any replica of r" + route.desc.getRangeId();
+        retryLater();
+        return;
+      }
       // The request id stays the same on every attempt; only the floor may have moved up.
-      KvRequest r = write ? request.toBuilder().setFirstIncompleteSeq(floor()).build() : request;
+      KvRequest.Builder r = request.toBuilder();
+      if (write) {
+        r.setFirstIncompleteSeq(floor());
+      }
+      ByteString cutAt = null;
+      if (route != null) {
+        r.setHeader(
+            RangeHeader.newBuilder()
+                .setRangeId(route.desc.getRangeId())
+                .setVersion(route.desc.getVersion()));
+        if (request.hasScan() && route.desc.hasEndKey()) {
+          ByteString end = route.desc.getEndKey();
+          if (!request.getScan().hasEndKey()
+              || ByteString.unsignedLexicographicalComparator()
+                      .compare(request.getScan().getEndKey(), end)
+                  > 0) {
+            r.setScan(request.getScan().toBuilder().setEndKey(end)); // one range at a time
+            cutAt = end;
+          }
+        }
+      }
       Duration timeout = Duration.ofNanos(Math.min(remaining, options.attemptTimeout().toNanos()));
       CompletableFuture<KvResponse> answer;
-      sentTo = target;
+      sentTo = address;
       try {
-        answer = channel(sentTo).call(r, timeout);
+        answer = channel(sentTo).call(r.build(), timeout);
       } catch (RuntimeException e) {
         answer = CompletableFuture.failedFuture(e);
       }
-      answer.whenComplete(this::onAnswer);
+      ByteString resumeAt = cutAt;
+      answer.whenComplete((response, failure) -> onAnswer(route, resumeAt, response, failure));
     }
 
-    private void onAnswer(KvResponse response, Throwable failure) {
+    private void onAnswer(
+        RangeCache.Route route, ByteString cutAt, KvResponse response, Throwable failure) {
       if (failure != null) {
         Throwable cause =
             failure instanceof CompletionException && failure.getCause() != null
@@ -344,7 +457,11 @@ public final class KvClient implements AutoCloseable {
         outcomeUnknown |= write && maybeDelivered;
         lastFailure = String.valueOf(cause.getMessage());
         if (cause instanceof RpcException e && e.kind().retryable()) {
-          moveOn(sentTo); // that node may be down; another may lead now
+          if (route != null) {
+            cache.rotate(route); // that node may be down; another replica may lead now
+          } else {
+            moveOn(sentTo);
+          }
           retryLater();
         } else {
           fail(KvException.Code.INTERNAL, "call failed: " + cause, cause);
@@ -352,6 +469,13 @@ public final class KvClient implements AutoCloseable {
         return;
       }
       if (!response.hasError()) {
+        if (cutAt != null && response.hasScan() && !response.getScan().hasResumeKey()) {
+          // The page reached the end of this range: the scan goes on in the next one.
+          response =
+              response.toBuilder()
+                  .setScan(response.getScan().toBuilder().setResumeKey(cutAt))
+                  .build();
+        }
         result.complete(response);
         return;
       }
@@ -369,14 +493,36 @@ public final class KvClient implements AutoCloseable {
           // Proposed by a leader that then lost the leadership: it may still commit.
           outcomeUnknown |= write && error.getNotLeader().getMaybeApplied();
           String hint = error.getNotLeader().getLeaderAddress();
-          if (!hint.isEmpty() && !hint.equals(sentTo) && redirects < seeds.size() + 2) {
+          if (!hint.isEmpty() && !hint.equals(sentTo) && redirects < seeds.size() + 4) {
             redirects++;
-            synchronized (KvClient.this) {
-              target = hint;
+            if (route != null) {
+              cache.setLeader(route, hint);
+              send(hint, route); // straight to the leader it named
+            } else {
+              synchronized (KvClient.this) {
+                target = hint;
+              }
+              send(hint, null);
             }
-            attempt(); // straight to the leader it named
           } else {
-            moveOn(sentTo); // it knows no leader (an election is on): try elsewhere, later
+            // It knows no leader (an election is on): try elsewhere, later.
+            if (route != null) {
+              cache.rotate(route);
+            } else {
+              moveOn(sentTo);
+            }
+            retryLater();
+          }
+        }
+        case RANGE_NOT_FOUND, EPOCH_MISMATCH -> {
+          // The range is not there, or has split since it was cached: look it up again.
+          if (route != null) {
+            cache.invalidate(route);
+          }
+          if (route != null && redirects < 8) {
+            redirects++;
+            attempt();
+          } else {
             retryLater();
           }
         }
@@ -416,6 +562,18 @@ public final class KvClient implements AutoCloseable {
     private void fail(KvException.Code code, String message, Throwable cause) {
       result.completeExceptionally(new KvException(code, outcomeUnknown, message, cause));
     }
+  }
+
+  /** The key that decides which range a request goes to. */
+  private static byte[] routingKey(KvRequest request) {
+    return switch (request.getOpCase()) {
+      case GET -> request.getGet().getKey().toByteArray();
+      case PUT -> request.getPut().getKey().toByteArray();
+      case DELETE -> request.getDelete().getKey().toByteArray();
+      case CPUT -> request.getCput().getKey().toByteArray();
+      case SCAN -> request.getScan().getStartKey().toByteArray();
+      default -> throw new IllegalArgumentException("no key in " + request.getOpCase());
+    };
   }
 
   private static KvResponse expect(KvResponse response, KvResponse.ResultCase expected) {

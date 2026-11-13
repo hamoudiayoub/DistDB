@@ -191,3 +191,137 @@ One entry per bug that took more than an hour: symptom, root cause, what it taug
   production defaults are 2 s within 5 s).
 - **Lesson:** retrying needs time left to retry in. The ratio of attempt timeout to deadline is a
   real design parameter, not a default to leave alone.
+
+---
+
+## 2026-11-11 — Learners that could never be installed: snapshots from before a split
+
+- **Symptom:** the first sharded simulation runs ended with learners that never caught up. The
+  final check found replicas that stayed uninitialized for seconds, with their range's leader
+  healthy and sending.
+- **Cause:** a leader sends the snapshot from its last log compaction, and with compaction every
+  1000 entries that snapshot could be the range's very first one, from before several splits. Its
+  span then covered keys that other ranges own now, and on the learner's node those ranges had
+  replicas. The store refuses a snapshot that overlaps another replica, rightly: installing it
+  would have overwritten their data. So the snapshot was refused forever.
+- **Fix:** a range compacts its log as soon as it applies a split, so the snapshot it sends always
+  carries the current span. Mutation S7 puts the bug back.
+- **Lesson:** a snapshot is not "the state", it is "the state at some index", and everything about
+  it (here, the span) is as of that index. Anything that checks a snapshot against the present has
+  to account for how old it is.
+
+---
+
+## 2026-11-11 — A range created on a node that was no longer a member
+
+- **Symptom:** in the same runs, a node held a replica of a range whose descriptor did not list it.
+  Nobody ever sent it anything, and its span blocked other ranges' snapshots there.
+- **Cause:** a node removed from a range, and later added back, receives the log it missed: its
+  removal, whatever happened while it was out, and the re-add. It applies all of it in order. When
+  that included a split, the node created the right-hand range with the members of that moment,
+  which did not include it. Since the new range does not count it as a member, it
+  never campaigns and never hears from anyone, so no `Removed` notice ever reaches it.
+- **Fix:** a split creates the new range on a node only if the node is one of its members (the
+  same rule CockroachDB uses); otherwise it deletes that part of the data. Mutation S9.
+- **Lesson:** every "create" needs to ask "should this exist here?", not just "can I build it?".
+
+---
+
+## 2026-11-11 — Raft assumed followers never lose their logs; a store broke that on purpose
+
+- **Symptom:** seed 36 of 200: learners still uninitialized at the end, but this time nothing
+  overlapped them. The leader reported their match index as 25 and 80, though their logs were
+  empty.
+- **Cause:** a node removed from a range keeps an orphan replica (nobody tells it). When the PD
+  added it back as a learner, the leader probed it and the orphan acknowledged entries up to 25.
+  Then a `Removed` notice arrived from a member that had not yet heard of the re-add (in answer to
+  an earlier pre-vote of the orphan), and the store destroyed the replica. The leader's match
+  index for it stayed at 25, so the leader probed just above 25 forever, and the empty replica
+  refused each probe. Raft never lowers a match index, because a correct follower never loses an
+  acknowledged entry.
+- **Fix, twice:**
+  - in Raft, a rejection that shows the follower's log is now shorter than its match index lowers
+    the match index, so the leader catches it up again (a new unit test removes a learner's log);
+  - in the store, a replica that has heard from a leader or candidate whose configuration is at
+    least as new as a `Removed` notice ignores the notice: it is being added back.
+
+  Neither is a safety issue. A learner's acknowledgements never count, and a voter can't be
+  destroyed this way: it would need a configuration in its log at least as new as the one that
+  removed it.
+- **Lesson:** the assumptions of a library become the host's obligations. Destroying replicas is
+  outside Raft's model, so the host has to restore what Raft expects, or teach Raft the new case.
+
+---
+
+## 2026-11-11 — The simulator recorded the wrong request ids
+
+- **Symptom:** the first sharded run failed at once: "acknowledged write null never took effect".
+- **Cause:** the Phase 5 harness learned each write's request id from its first attempt, which
+  `KvClient` sent synchronously. With range routing, the first attempt waits for the PD's answer,
+  so the id was not known yet when the harness read it.
+- **Fix:** the harness derives the id itself: a client numbers its writes 1, 2, 3, ... in the
+  order they are issued.
+- **Lesson:** a harness that leans on timing details of the code under test breaks when they
+  change. Derive what you can from the contract.
+
+---
+
+## 2026-11-11 — The simulators could hide any exception as a "disk failure"
+
+- **Symptom:** none yet, which was the problem. While chasing a real-process failure, I noticed
+  that any exception thrown inside a store's mailbox goes through the "storage failed" path, and
+  both simulators counted that as a disk fault and restarted the node. A logic bug (an
+  `IllegalStateException` in a split, say) would have looked like bad luck with disks, and the run
+  would have passed. In a real process the same exception halts the node.
+- **Fix:** the simulators now fail the run unless the failure is a `StorageException` on a disk
+  that the simulator really made fail. No run since has stopped on such an exception, so nothing
+  had been hidden.
+- **Lesson:** a fault injector must check that each failure it absorbs is one it caused.
+  Otherwise "the system survived a fault" and "the system crashed" look the same.
+
+---
+
+## 2026-11-11 — Seven JVMs on one machine, and 10 ms ticks
+
+- **Symptom:** `ShardedClusterTest` failed once in a full build: a write got `NotLeader` for
+  range 1 for its whole 60 s deadline. Run alone, it passed, but the first writes took 18 to 20 s.
+- **Cause:** two things. Eight cold JVMs (three PD nodes, four data nodes, the test) start on one
+  machine; the PD answered nothing for the first seconds, and stores learn each other's addresses
+  only from the PD. And stores ticked every 10 ms, so a range calls an election after 100 to
+  200 ms without hearing its leader. On a machine also running the simulations, heartbeats were
+  late more often than that, and elections followed one another.
+- **Fix:** stores now default to 50 ms ticks (elections after 0.5 to 1 s). A store ticks every
+  range it holds, so ticks also cost CPU per range; TiKV and CockroachDB use far longer ones. The
+  test now waits for the cluster to form before timing writes, with generous deadlines. Once
+  formed: 200 writes in 3.7 s, four ranges after 6.8 s.
+- **Lesson:** timeouts are a bet on the slowest machine you will run on, not the average one.
+
+---
+
+## 2026-11-11 — Two committed entries at one index: a destroyed replica voted again
+
+- **Symptom:** the first 500-seed gate run failed at seed 231. At the end, two replicas of range
+  r3 held different descriptors, and the leader could not commit past index 10. A per-range check
+  added for the hunt (every replica must apply the same entry at each index) then pinpointed it:
+  index 8 was a membership change on three replicas and a no-op on a fourth.
+- **Cause:** with the trace of r3:
+  1. Index 8 promoted n4, and committed with n3's acknowledgement.
+  2. Index 10 removed n3. A member's `Removed` notice later made n3 destroy its replica; its log
+     was gone, and its term and vote stayed.
+  3. The PD added n3 back as a learner, and the leader sent it the range's initial snapshot,
+     whose membership still says voters {1, 2, 3}.
+  4. n2 had stalled at index 7, so it still used the old configuration {1, 2, 3}. It campaigned,
+     and n3, with a log ending at 5, found n2's log complete enough and voted for it. Two of
+     {1, 2, 3} is a majority, so n2 led and committed something else at index 8.
+
+  The design note's argument said that once a removal is committed, the removed node's copy of
+  the log no longer matters. That holds only if the node never votes again with less than it
+  had. A candidate on an older configuration still counts it.
+- **Fix:** the tombstone records how long the log was when the replica was destroyed. A replica
+  created again neither votes nor campaigns until its log is that long; then it holds every entry
+  it ever acknowledged, because it caught up from a leader. (CockroachDB gives a re-added replica
+  a new id instead, so old configurations do not count it.) The 500-seed gate then passed.
+- **Lesson:** "delete the data, keep the vote" was not enough: a vote is only safe if it is cast
+  with at least the log behind every promise made before. Also, the end-of-run checks only saw a
+  symptom; checking the core property continuously found the moment it broke. That check stays in
+  the gate.

@@ -32,7 +32,10 @@ final class KvRequests {
     }
   }
 
-  /** Validates a Put or Delete: a well-formed request id, and key and value within limits. */
+  /**
+   * Validates a Put, Delete or ConditionalPut: a well-formed request id, and key and value within
+   * limits.
+   */
   static void validateWrite(KvRequest request, KvServiceOptions options) {
     if (!request.hasRequestId()) {
       throw new InvalidRequest("writes must carry a request id, so retries are safe");
@@ -57,8 +60,31 @@ final class KvRequests {
         }
       }
       case DELETE -> key(request.getDelete().getKey(), options.maxKeyBytes());
+      case CPUT -> {
+        key(request.getCput().getKey(), options.maxKeyBytes());
+        int size = request.getCput().getValue().size();
+        if (size > options.maxValueBytes()) {
+          throw new InvalidRequest(
+              "value is " + size + " bytes; the limit is " + options.maxValueBytes());
+        }
+      }
       default -> throw new InvalidRequest("not a write: " + request.getOpCase());
     }
+  }
+
+  /** Whether {@code request} is a write (it then needs a request id). */
+  static boolean isWrite(KvRequest request) {
+    return request.hasPut() || request.hasDelete() || request.hasCput();
+  }
+
+  /** The client key a write changes. */
+  static byte[] writeKey(KvRequest request) {
+    return switch (request.getOpCase()) {
+      case PUT -> request.getPut().getKey().toByteArray();
+      case DELETE -> request.getDelete().getKey().toByteArray();
+      case CPUT -> request.getCput().getKey().toByteArray();
+      default -> throw new IllegalArgumentException("not a write: " + request.getOpCase());
+    };
   }
 
   static byte[] key(ByteString key, int maxBytes) {
