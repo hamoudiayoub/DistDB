@@ -1,6 +1,7 @@
 package io.distdb.txn;
 
 import com.google.protobuf.ByteString;
+import io.distdb.common.Bytes;
 import io.distdb.rpc.proto.Error;
 import io.distdb.rpc.proto.KvRequest;
 import io.distdb.rpc.proto.KvResponse;
@@ -69,14 +70,28 @@ public final class Txn {
    */
   public CompletableFuture<List<Entry>> scan(byte[] start, byte[] end, int limit) {
     TreeMap<byte[], byte[]> out = new TreeMap<>(Arrays::compareUnsigned);
-    return scanFrom(start, end, out, deadline())
-        .thenApply(v -> {
-          // Overlay our own writes.
+    // Our own deletes can hide at most one stored entry each, so this many stored entries are
+    // enough for `limit` results; the scan stops there.
+    int own = 0;
+    for (byte[] k : writes.keySet()) {
+      if (Arrays.compareUnsigned(k, start) >= 0
+          && (end == null || Arrays.compareUnsigned(k, end) < 0)) {
+        own++;
+      }
+    }
+    int need =
+        limit <= 0 ? Integer.MAX_VALUE : (int) Math.min(Integer.MAX_VALUE, (long) limit + own);
+    return scanFrom(start, end, out, need, deadline())
+        .thenApply(complete -> {
+          // Overlay our own writes, within the part of the span the stored entries covered: when
+          // the scan stopped early, own writes past its last key would skip stored keys before
+          // them.
+          byte[] covered = complete || out.isEmpty() ? end : Bytes.successor(out.lastKey());
           for (Map.Entry<byte[], Mutation> w : writes.entrySet()) {
             byte[] k = w.getKey();
             boolean inside =
                 Arrays.compareUnsigned(k, start) >= 0
-                    && (end == null || Arrays.compareUnsigned(k, end) < 0);
+                    && (covered == null || Arrays.compareUnsigned(k, covered) < 0);
             if (inside) {
               if (w.getValue().getOp() == Mutation.Op.PUT) {
                 out.put(k, w.getValue().getValue().toByteArray());
@@ -96,12 +111,19 @@ public final class Txn {
         });
   }
 
-  private CompletableFuture<Void> scanFrom(
-      byte[] start, byte[] end, TreeMap<byte[], byte[]> out, long deadline) {
+  /**
+   * Reads stored entries of {@code [start, end)} into {@code out} until there are {@code need} of
+   * them; completes with whether it read the whole span.
+   */
+  private CompletableFuture<Boolean> scanFrom(
+      byte[] start, byte[] end, TreeMap<byte[], byte[]> out, int need, long deadline) {
     TxnScanRequest.Builder scan =
         TxnScanRequest.newBuilder().setStartKey(ByteString.copyFrom(start)).setReadTs(startTs);
     if (end != null) {
       scan.setEndKey(ByteString.copyFrom(end));
+    }
+    if (need != Integer.MAX_VALUE) {
+      scan.setLimit(need - out.size());
     }
     return read(KvRequest.newBuilder().setTxnScan(scan).build(), deadline)
         .thenCompose(r -> {
@@ -109,9 +131,12 @@ public final class Txn {
             out.put(e.getKey().toByteArray(), e.getValue().toByteArray());
           }
           if (!r.getTxnScan().hasResumeKey()) {
-            return CompletableFuture.completedFuture(null);
+            return CompletableFuture.completedFuture(true);
           }
-          return scanFrom(r.getTxnScan().getResumeKey().toByteArray(), end, out, deadline);
+          if (out.size() >= need) {
+            return CompletableFuture.completedFuture(false);
+          }
+          return scanFrom(r.getTxnScan().getResumeKey().toByteArray(), end, out, need, deadline);
         });
   }
 

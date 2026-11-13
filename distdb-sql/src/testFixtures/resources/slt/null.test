@@ -1,0 +1,157 @@
+# NULL and three-valued logic.
+
+query TTTT nosort
+SELECT NULL IS NULL, NULL IS NOT NULL, 1 = NULL, NULL = NULL
+----
+t f NULL NULL
+
+query TTTT nosort
+SELECT true AND NULL, false AND NULL, true OR NULL, false OR NULL
+----
+NULL f t NULL
+
+query TT nosort
+SELECT NOT NULL::boolean, (NULL::boolean) IS TRUE
+----
+NULL f
+
+query TTTT nosort
+SELECT 1 IN (1, NULL), 2 IN (1, NULL), 2 NOT IN (1, NULL), NULL IN (1, 2)
+----
+t NULL NULL NULL
+
+query TTT nosort
+SELECT NULL IS DISTINCT FROM NULL, 1 IS DISTINCT FROM NULL, 1 IS NOT DISTINCT FROM 1
+----
+f t t
+
+query TTT nosort
+SELECT 1 + NULL, 'a' || NULL, coalesce(NULL, NULL, 'z')
+----
+NULL NULL z
+
+statement ok
+CREATE TABLE n (id INT PRIMARY KEY, v INT, s TEXT)
+
+statement ok
+INSERT INTO n VALUES (1, 10, 'a'), (2, NULL, 'b'), (3, 30, NULL), (4, NULL, NULL), (5, 20, 'a')
+
+query I nosort
+SELECT id FROM n WHERE v IS NULL ORDER BY id
+----
+2
+4
+
+query I nosort
+SELECT id FROM n WHERE v > 15 ORDER BY id
+----
+3
+5
+
+query I nosort
+SELECT id FROM n WHERE NOT (v > 15) ORDER BY id
+----
+1
+
+query I nosort
+SELECT id FROM n WHERE v <> 10 OR s = 'b' ORDER BY id
+----
+2
+3
+5
+
+query IIII nosort
+SELECT count(*), count(v), count(s), count(DISTINCT s) FROM n
+----
+5 3 3 2
+
+query ITT nosort
+SELECT sum(v), avg(v), max(s) FROM n
+----
+60 20.0000000000000000 b
+
+query II nosort
+SELECT id, v FROM n ORDER BY v, id
+----
+1 10
+5 20
+3 30
+2 NULL
+4 NULL
+
+query II nosort
+SELECT id, v FROM n ORDER BY v DESC, id
+----
+2 NULL
+4 NULL
+3 30
+5 20
+1 10
+
+query II nosort
+SELECT id, v FROM n ORDER BY v NULLS FIRST, id
+----
+2 NULL
+4 NULL
+1 10
+5 20
+3 30
+
+query II nosort
+SELECT id, v FROM n ORDER BY v DESC NULLS LAST, id
+----
+3 30
+5 20
+1 10
+2 NULL
+4 NULL
+
+query TI rowsort
+SELECT s, count(*) FROM n GROUP BY s
+----
+NULL 2
+a 2
+b 1
+
+query I nosort
+SELECT sum(v) FROM n WHERE id > 100
+----
+NULL
+
+query I nosort
+SELECT count(*) FROM n WHERE id > 100
+----
+0
+
+query T rowsort
+SELECT DISTINCT s FROM n
+----
+NULL
+a
+b
+
+statement ok
+CREATE TABLE u (id INT PRIMARY KEY, k INT UNIQUE)
+
+statement ok
+INSERT INTO u VALUES (1, NULL), (2, NULL), (3, 3)
+
+statement error 23505
+INSERT INTO u VALUES (4, 3)
+
+query I nosort
+SELECT count(*) FROM u WHERE k IS NULL
+----
+2
+
+statement ok
+CREATE TABLE nn (id INT PRIMARY KEY, v INT NOT NULL)
+
+statement error 23502
+INSERT INTO nn VALUES (1, NULL)
+
+statement error 23502
+INSERT INTO nn (id) VALUES (2)
+
+statement error 23502
+INSERT INTO nn VALUES (NULL, 1)

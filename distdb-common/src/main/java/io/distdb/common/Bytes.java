@@ -49,6 +49,11 @@ public final class Bytes {
     return Optional.empty();
   }
 
+  /** The smallest key greater than {@code key}: {@code key} followed by a zero byte. */
+  public static byte[] successor(byte[] key) {
+    return Arrays.copyOf(key, key.length + 1);
+  }
+
   /** Lowercase hexadecimal, for logs and debugging. */
   public static String toHex(byte[] bytes) {
     return HEX.formatHex(bytes);

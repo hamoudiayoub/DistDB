@@ -1,0 +1,233 @@
+# Joins: every kind, on keys and not, with filters.
+
+statement ok
+CREATE TABLE dept (id INT PRIMARY KEY, name TEXT UNIQUE, floor INT)
+
+statement ok
+CREATE TABLE person (id INT PRIMARY KEY, name TEXT, dept_id INT, boss INT)
+
+statement ok
+INSERT INTO dept VALUES (1, 'eng', 3), (2, 'sales', 1), (3, 'ops', 2), (4, 'empty', 9)
+
+statement ok
+INSERT INTO person VALUES
+  (10, 'alice', 1, NULL),
+  (11, 'bob', 1, 10),
+  (12, 'carol', 2, 10),
+  (13, 'dave', 2, 12),
+  (14, 'erin', NULL, 10),
+  (15, 'frank', 3, 12),
+  (16, 'grace', 7, 15)
+
+query TT rowsort
+SELECT p.name, d.name FROM person p JOIN dept d ON p.dept_id = d.id
+----
+alice eng
+bob eng
+carol sales
+dave sales
+frank ops
+
+query TT rowsort
+SELECT p.name, d.name FROM person p INNER JOIN dept d ON d.id = p.dept_id WHERE d.floor > 1
+----
+alice eng
+bob eng
+frank ops
+
+query TT rowsort
+SELECT p.name, d.name FROM person p LEFT JOIN dept d ON p.dept_id = d.id
+----
+alice eng
+bob eng
+carol sales
+dave sales
+erin NULL
+frank ops
+grace NULL
+
+query TT rowsort
+SELECT p.name, d.name FROM person p RIGHT JOIN dept d ON p.dept_id = d.id
+----
+NULL empty
+alice eng
+bob eng
+carol sales
+dave sales
+frank ops
+
+query TT rowsort
+SELECT p.name, d.name FROM person p FULL JOIN dept d ON p.dept_id = d.id
+----
+NULL empty
+alice eng
+bob eng
+carol sales
+dave sales
+erin NULL
+frank ops
+grace NULL
+
+query TT rowsort
+SELECT p.name, d.name FROM person p LEFT JOIN dept d ON p.dept_id = d.id AND d.floor > 1
+----
+alice eng
+bob eng
+carol NULL
+dave NULL
+erin NULL
+frank ops
+grace NULL
+
+query T rowsort
+SELECT p.name FROM person p LEFT JOIN dept d ON p.dept_id = d.id WHERE d.id IS NULL
+----
+erin
+grace
+
+query I nosort
+SELECT count(*) FROM person CROSS JOIN dept
+----
+28
+
+query I nosort
+SELECT count(*) FROM person, dept WHERE person.dept_id = dept.id
+----
+5
+
+query TT rowsort
+SELECT a.name, b.name FROM person a JOIN person b ON a.boss = b.id
+----
+bob alice
+carol alice
+dave carol
+erin alice
+frank carol
+grace frank
+
+query TT rowsort
+SELECT a.name, b.name FROM person a LEFT JOIN person b ON a.boss = b.id WHERE a.id > 12
+----
+dave carol
+erin alice
+frank carol
+grace frank
+
+query TTT rowsort
+SELECT a.name, b.name, c.name FROM person a JOIN person b ON a.boss = b.id JOIN person c ON b.boss = c.id
+----
+dave carol alice
+frank carol alice
+grace frank carol
+
+query TTI rowsort
+SELECT p.name, d.name, d.floor FROM person p JOIN dept d ON p.dept_id = d.id WHERE p.id = 13
+----
+dave sales 1
+
+query TT rowsort
+SELECT p.name, d.name FROM person p JOIN dept d ON p.dept_id = d.id AND p.name < d.name
+----
+alice eng
+bob eng
+carol sales
+dave sales
+frank ops
+
+query TT rowsort
+SELECT p.name, d.name FROM person p JOIN dept d ON p.dept_id < d.id WHERE p.id IN (10, 15)
+----
+alice empty
+alice ops
+alice sales
+frank empty
+
+query TT rowsort
+SELECT p.name, d.name FROM dept d JOIN person p ON d.name = 'eng' AND p.dept_id = d.id
+----
+alice eng
+bob eng
+
+statement ok
+CREATE TABLE a (k INT, x TEXT)
+
+statement ok
+CREATE TABLE b (k INT, y TEXT)
+
+statement ok
+INSERT INTO a VALUES (1, 'a1'), (2, 'a2'), (2, 'a2bis'), (NULL, 'anull')
+
+statement ok
+INSERT INTO b VALUES (2, 'b2'), (3, 'b3'), (NULL, 'bnull')
+
+query ITT rowsort
+SELECT * FROM a JOIN b USING (k)
+----
+2 a2 b2
+2 a2bis b2
+
+query ITT rowsort
+SELECT * FROM a LEFT JOIN b USING (k)
+----
+1 a1 NULL
+2 a2 b2
+2 a2bis b2
+NULL anull NULL
+
+query ITT rowsort
+SELECT * FROM a FULL JOIN b USING (k)
+----
+1 a1 NULL
+2 a2 b2
+2 a2bis b2
+3 NULL b3
+NULL NULL bnull
+NULL anull NULL
+
+query TT rowsort
+SELECT a.x, b.y FROM a JOIN b ON a.k = b.k OR (a.k IS NULL AND b.k IS NULL)
+----
+a2 b2
+a2bis b2
+anull bnull
+
+query ITIT rowsort
+SELECT * FROM a RIGHT JOIN b ON a.k = b.k
+----
+2 a2 2 b2
+2 a2bis 2 b2
+NULL NULL 3 b3
+NULL NULL NULL bnull
+
+query TT rowsort
+SELECT x, y FROM a, b WHERE a.k + 1 = b.k
+----
+a1 b2
+a2 b3
+a2bis b3
+
+query TI rowsort
+SELECT d.name, count(p.id) FROM dept d LEFT JOIN person p ON p.dept_id = d.id GROUP BY d.name
+----
+empty 0
+eng 2
+ops 1
+sales 2
+
+query TT nosort
+SELECT p.name, d.name FROM person p JOIN dept d ON p.dept_id = d.id ORDER BY d.floor, p.name LIMIT 3
+----
+carol sales
+dave sales
+frank ops
+
+query TT rowsort
+SELECT p.name, (SELECT name FROM dept WHERE id = p.dept_id) FROM person p
+----
+alice eng
+bob eng
+carol sales
+dave sales
+erin NULL
+frank ops
+grace NULL

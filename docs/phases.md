@@ -6,7 +6,7 @@ ranges, and any node answers SQL from `psql`. It is built bottom-up in ten phase
 ends at a **gate**, a test that proves it works, and leaves a design note in `docs/design/`.
 
 This document explains what each phase does, how it works, and what to learn from it.
-**Phases 1–7 are built** (with their measured results); **phases 8–10 are the plan.**
+**Phases 1–8 are built** (with their measured results); **phases 9–10 are the plan.**
 
 ```
  SQL (8, 9)      psql ─▶ pgwire ─▶ parser ─▶ planner ─▶ distributed executor
@@ -434,38 +434,116 @@ failures and 10,556 partitions. No audit was ever off by a unit.
 
 ---
 
-## Phase 8: SQL layer *(planned)*
+## Phase 8: SQL layer
 
-**Goal.** Turn SQL into transactional key-value operations, so `psql` or JDBC can connect to any
-node and run real queries.
+**Goal.** Turn SQL into transactional key-value operations, so that `psql` or JDBC can connect to
+any node and run real queries, with PostgreSQL's answers.
 
-**What it will build.**
-- **Table-to-key mapping**, using the Phase 1 encoding so key order equals SQL order:
-  - a row is stored at `/t/{table}/pk/{primary key}` → its other columns;
-  - a secondary index entry at `/t/{table}/i/{index}/{columns}/{pk}`;
-  - a unique index entry at `/t/{table}/i/{index}/{columns}` → the primary key.
+**What it builds.**
+- **Tables as keys**, in Phase 1's order-preserving encoding, so key order is SQL order:
+  - a row is stored at `/{table}/1/{primary key}` → its other columns as `(column id, value)`;
+  - a secondary index entry at `/{table}/{index}/{columns}/{primary key}`;
+  - a unique index entry at `/{table}/{index}/{columns}` → the primary key.
 
-  A row and its index entries are written in one transaction, so they never disagree.
-- **Catalog:** table and index definitions stored as keys, cached on each node with a version
-  number.
+  A row and its entries are written by one transaction. Uniqueness costs nothing extra: two
+  inserts of one key both write it, and Phase 7 lets only the first commit. NUMERIC keys sort by
+  value (sign, exponent, digits); a table without a primary key gets a hidden `rowid` from the
+  TSO.
+- **The catalog** in reserved keys (`/1/...`): descriptors, names, an id counter and a version.
+  Each transaction reads the version in its own snapshot and reuses the node's cached descriptors
+  when it matches.
+- **Schema changes that cannot lose a writer:** `CREATE INDEX` adds the index WRITE_ONLY (writers
+  maintain it, readers ignore it), then **fences** (every range's transaction floor goes to that
+  commit, and every older lock is resolved, so no transaction with the old schema can commit), then
+  backfills and publishes. `DROP INDEX` and `DROP TABLE` remove the definition, fence, then delete
+  the keys.
 - **The pipeline:**
-  - **parser:** hand-written recursive descent, Pratt parsing for expressions, an AST of sealed
-    interfaces and records;
-  - **binder:** names and types;
-  - **planner:** logical, then physical plans;
-  - **executor:** Volcano-style iterators, running on the gateway node.
-- **SQL surface:** `CREATE TABLE`/`INDEX`, `INSERT`, `SELECT` with joins, `GROUP BY`,
-  `ORDER BY`, `LIMIT`, `UPDATE`, `DELETE`, `BEGIN`/`COMMIT`/`ROLLBACK`.
-- **pgwire:** the PostgreSQL wire protocol v3 (startup, simple query, then extended query for
-  prepared statements), with one virtual thread per connection.
+  - **parser:** hand-written recursive descent, Pratt parsing with PostgreSQL's precedence, an AST
+    of sealed records;
+  - **binder:** scopes (correlated subqueries become outer references), PostgreSQL's types
+    (`1.5` is NUMERIC, `'x'` is unknown until its context types it), aggregation checks;
+  - **planner:** predicate pushdown; access paths (point get, index or key range, full scan);
+    joins (hash, lookup, nested loop). No statistics yet, so it uses rules of thumb;
+  - **executor:** Volcano iterators on the gateway node, all join kinds, hash aggregation, sort,
+    set operations, `EXPLAIN`.
+- **SQL surface:** `CREATE`/`DROP TABLE` and `INDEX` (`UNIQUE`, `PRIMARY KEY`, `NOT NULL`,
+  `DEFAULT`), `INSERT` (multi-row, `SELECT`, `ON CONFLICT DO NOTHING`, `RETURNING`), `UPDATE`,
+  `DELETE`, `SELECT` with every join, `GROUP BY`/`HAVING`, `DISTINCT`, `ORDER BY`, `LIMIT`/`OFFSET`,
+  subqueries, CTEs, `VALUES`, `UNION`/`INTERSECT`/`EXCEPT`; `BEGIN`/`COMMIT`/`ROLLBACK`.
+  Types: BOOLEAN, BIGINT, DOUBLE PRECISION, NUMERIC (with PostgreSQL's scale rules), TEXT/VARCHAR.
+- **pgwire:** PostgreSQL's protocol v3, one virtual thread per connection: startup (TLS declined,
+  trust authentication), simple query (psql), extended query (JDBC: prepared statements, text and
+  binary values, portals with a row limit), error recovery to `Sync`.
+- **`distdb node --sql HOST:PORT`** serves SQL from any data node.
 
-**Concepts to learn.** Relational algebra; mapping relations onto ordered key-value storage;
-parsing techniques; name resolution; logical vs physical plans; join algorithms (nested loop,
-hash, index lookup); aggregation and sorting; wire protocols. *Read:* the CMU 15-445 lectures on
-query processing, and the CockroachDB paper.
+**How it works, in one example.** `UPDATE accounts SET balance = balance - 10 WHERE id = 7`
+arrives at node 2. The session begins a transaction (a TSO timestamp) and reads the catalog
+version (one get; the descriptors come from the cache). The binder resolves `balance` and `id`,
+and the planner turns `id = 7` into a point get of `/100/1/7`. The executor reads that row at the
+snapshot and computes the new row. It writes the row (and any index entry whose key changed) into
+the transaction's buffer, and commits: Percolator's prewrite, commit timestamp, primary commit.
+The client gets `UPDATE 1`. Had another transaction updated row 7 since the snapshot, the prewrite
+would have refused, and the session would have run the statement again (autocommit), or returned
+40001 (in `BEGIN`).
 
-**Gate.** `psql` connects to any node and runs joins and transactions. Results match PostgreSQL
-on sqllogictest files. **Milestone:** a distributed SQL database.
+**Concepts to learn.**
+- Relational algebra, and mapping relations onto ordered key-value storage.
+- Parsing: recursive descent and Pratt parsing.
+- Name resolution, scopes and correlation; PostgreSQL's type resolution.
+- Logical vs physical plans; access paths; join algorithms (nested loop, hash, index lookup);
+  aggregation and sorting.
+- Why a schema change is write skew under snapshot isolation (F1's online schema changes), and
+  wire protocols.
+
+*Read:* the CMU 15-445 lectures on query processing, the CockroachDB paper, and the F1 schema
+change paper.
+
+**How it's tested.**
+- **sqllogictest files, with PostgreSQL as the oracle:** 11 hand-written files, plus 400 random
+  queries from a fuzzer (filters, all joins, grouping, subqueries, set operations, NULLs). The
+  expected results were recorded from a real PostgreSQL 18; DistDB must match them value for value
+  (and SQLSTATE for SQLSTATE), on one node (`SqlLogicTest`) and on the simulated sharded cluster
+  (`SqlLogicSimulationTest`).
+- **`SqlBankSimulationTest` (the gate):** a bank in SQL on Phase 6's faulty cluster. Up to eight
+  sessions on up to three gateways run multi-statement transfers, single-statement transfers, owner
+  changes, audits and index audits. An admin session builds, drops and rebuilds a secondary index
+  under that load (and tries a unique index that must fail). Each session is a fiber of the
+  simulation, so their statements interleave deterministically. Checks: every audit holds the
+  opening total; an index lookup always agrees with a full scan; afterwards every public index has
+  exactly one entry per row; only the errors faults explain; replicas converge.
+- **`SqlClusterTest`:** three PD JVMs and three data nodes with `--sql`. JDBC on three different
+  nodes creates, joins, indexes and conflicts (40001); then `psql` runs a script.
+- **`PgServerTest`:** PostgreSQL's JDBC driver against the wire protocol.
+- **`SessionTest`:** plan choices, prepared statements, isolation across sessions, the fence.
+- **`RowCodecTest`:** key order equals SQL order, as properties.
+
+**Gate.** **1,000 seeds** pass (about 2.5 seconds per seed):
+- **Money:** 15,345 transfers committed, 3,568 accounts opened and 2,488 closed. All 8,571
+  audits found the opening total, and all 6,332 index audits agreed with a full scan.
+- **Schema changes under load:** 1,303 index builds and 303 drops. Faults cut 392 builds short,
+  and each was cleaned up.
+- **Faults:** 10,571 power cuts, 10,463 partitions and 5,605 disk failures, with 11,749 splits and
+  621,110 membership changes.
+- **Errors sessions saw:** 6,889 serialization failures (conflicts and fences), 331 unknown
+  outcomes and 3,872 timeouts. None of them ever cost a unit of money or an index entry.
+
+The sqllogictest files hold 162 statements and 619 queries, and DistDB gives PostgreSQL 18's
+answers to all of them, on one node and on the cluster. `psql` and JDBC work against real
+processes.
+- Of nine bugs planted on purpose, every one was caught: three by the bank simulation, seven by the
+  unit tests and sqllogictest, one only by a targeted test (`FenceTest`).
+- Two planted bugs first survived, which showed a gap in the workload (it never inserted) and a
+  race too narrow for random runs.
+
+
+*Passed.* (This phase is not committed yet.)
+
+**Lessons.**
+- A schema read is a read: under snapshot isolation, a writer with an old schema and a schema
+  change are write skew. The transaction floor bounds old schemas, as leases do in F1.
+- A reference implementation is a better oracle than expected results written by hand: it found
+  three of my assumptions in the first run.
+- Blocking code fits in a deterministic simulator as coroutines, never as nested event loops.
 
 ---
 

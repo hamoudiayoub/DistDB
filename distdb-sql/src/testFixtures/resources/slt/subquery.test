@@ -1,0 +1,117 @@
+# Subqueries: scalar, IN, EXISTS, correlated or not.
+
+statement ok
+CREATE TABLE c (id INT PRIMARY KEY, name TEXT)
+
+statement ok
+CREATE TABLE o (id INT PRIMARY KEY, cust INT, amount INT)
+
+statement ok
+INSERT INTO c VALUES (1, 'ann'), (2, 'ben'), (3, 'cid'), (4, 'dot')
+
+statement ok
+INSERT INTO o VALUES (10, 1, 50), (11, 1, 20), (12, 2, 70), (13, 3, 5), (14, NULL, 99)
+
+query T nosort
+SELECT name FROM c WHERE id IN (SELECT cust FROM o) ORDER BY name
+----
+ann
+ben
+cid
+
+query T nosort
+SELECT name FROM c WHERE id NOT IN (SELECT cust FROM o WHERE cust IS NOT NULL) ORDER BY name
+----
+dot
+
+query I nosort
+SELECT count(*) FROM c WHERE id NOT IN (SELECT cust FROM o)
+----
+0
+
+query T nosort
+SELECT name FROM c WHERE EXISTS (SELECT 1 FROM o WHERE o.cust = c.id AND o.amount > 30) ORDER BY name
+----
+ann
+ben
+
+query T nosort
+SELECT name FROM c WHERE NOT EXISTS (SELECT * FROM o WHERE o.cust = c.id) ORDER BY name
+----
+dot
+
+query TI nosort
+SELECT name, (SELECT sum(amount) FROM o WHERE o.cust = c.id) FROM c ORDER BY id
+----
+ann 70
+ben 70
+cid 5
+dot NULL
+
+query TI nosort
+SELECT name, (SELECT count(*) FROM o WHERE o.cust = c.id) AS n FROM c ORDER BY n DESC, name
+----
+ann 2
+ben 1
+cid 1
+dot 0
+
+query I nosort
+SELECT id FROM o WHERE amount > (SELECT avg(amount) FROM o) ORDER BY id
+----
+10
+12
+14
+
+query I nosort
+SELECT id FROM o o1 WHERE amount = (SELECT max(amount) FROM o o2 WHERE o2.cust = o1.cust) ORDER BY id
+----
+10
+12
+13
+
+query TT nosort
+SELECT name, (SELECT max(amount) FROM o WHERE cust = c.id) > 40 FROM c ORDER BY id
+----
+ann t
+ben t
+cid f
+dot NULL
+
+query T nosort
+SELECT name FROM c WHERE (SELECT count(*) FROM o WHERE o.cust = c.id) = 2
+----
+ann
+
+query I nosort
+SELECT (SELECT 1 WHERE false)
+----
+NULL
+
+query I nosort
+SELECT count(*) FROM (SELECT cust FROM o GROUP BY cust) g
+----
+4
+
+query TI nosort
+SELECT name, total FROM c JOIN (SELECT cust, sum(amount) AS total FROM o GROUP BY cust) t ON t.cust = c.id ORDER BY total
+----
+cid 5
+ann 70
+ben 70
+
+query I nosort
+SELECT id FROM c WHERE id IN (1, 2) AND id IN (SELECT cust FROM o WHERE amount < 60) ORDER BY id
+----
+1
+
+query T nosort
+SELECT name FROM c WHERE EXISTS (SELECT 1 FROM o WHERE o.cust = c.id AND EXISTS (SELECT 1 FROM c c2 WHERE c2.id = o.cust AND c2.name < 'b')) ORDER BY name
+----
+ann
+
+statement error 21000
+SELECT name, (SELECT amount FROM o WHERE o.cust = c.id) FROM c
+
+statement error 42601
+SELECT name FROM c WHERE id IN (SELECT id, cust FROM o)

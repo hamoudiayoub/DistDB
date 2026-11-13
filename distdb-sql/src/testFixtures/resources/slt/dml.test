@@ -1,0 +1,236 @@
+# INSERT, UPDATE and DELETE.
+
+statement ok
+CREATE TABLE item (id INT PRIMARY KEY, name TEXT NOT NULL, qty INT DEFAULT 1, note TEXT DEFAULT 'none', price NUMERIC(6, 2))
+
+statement ok
+INSERT INTO item (id, name) VALUES (1, 'bolt')
+
+statement ok
+INSERT INTO item VALUES (2, 'nut', DEFAULT, DEFAULT, 0.5), (3, 'gear', 7, 'heavy', 12.345)
+
+statement ok
+INSERT INTO item (name, id, price) VALUES ('cog', 4, 3)
+
+query ITITT nosort
+SELECT * FROM item ORDER BY id
+----
+1 bolt 1 none NULL
+2 nut 1 none 0.50
+3 gear 7 heavy 12.35
+4 cog 1 none 3.00
+
+query IT nosort
+INSERT INTO item VALUES (5, 'spring', 2, 'x', 1) RETURNING id, name
+----
+5 spring
+
+query T nosort
+INSERT INTO item (id, name) VALUES (6, 'washer'), (7, 'pin') RETURNING note
+----
+none
+none
+
+statement ok
+INSERT INTO item SELECT id + 100, upper(name), qty * 2, note, price FROM item WHERE id <= 2
+
+query ITI nosort
+SELECT id, name, qty FROM item WHERE id > 100 ORDER BY id
+----
+101 BOLT 2
+102 NUT 2
+
+statement ok
+INSERT INTO item VALUES (1, 'dup', 1, 'x', 1) ON CONFLICT DO NOTHING
+
+query T nosort
+SELECT name FROM item WHERE id = 1
+----
+bolt
+
+statement error 23505
+INSERT INTO item VALUES (8, 'a', 1, 'x', 1), (8, 'b', 1, 'x', 1)
+
+query I nosort
+SELECT count(*) FROM item WHERE id = 8
+----
+0
+
+statement error 23502
+INSERT INTO item (id) VALUES (9)
+
+statement error 42703
+INSERT INTO item (id, nosuch) VALUES (9, 1)
+
+statement error 42601
+INSERT INTO item (id, name) VALUES (9, 'a', 'b')
+
+statement error 42804
+INSERT INTO item (id, name, qty) VALUES (9, 'a', 'text'::text)
+
+statement ok
+UPDATE item SET qty = qty + 10 WHERE id IN (1, 2)
+
+query II nosort
+SELECT id, qty FROM item WHERE id <= 2 ORDER BY id
+----
+1 11
+2 11
+
+statement ok
+UPDATE item SET note = 'cheap', price = price / 2 WHERE price < 1
+
+query ITT nosort
+SELECT id, note, price FROM item WHERE note = 'cheap' ORDER BY id
+----
+2 cheap 0.25
+102 cheap 0.25
+
+query IT nosort
+UPDATE item SET name = name || '!' WHERE id = 3 RETURNING id, name
+----
+3 gear!
+
+statement ok
+UPDATE item SET id = id + 1000 WHERE id = 4
+
+query IT nosort
+SELECT id, name FROM item WHERE name = 'cog'
+----
+1004 cog
+
+statement error 23505
+UPDATE item SET id = 1 WHERE id = 2
+
+statement error 23502
+UPDATE item SET name = NULL WHERE id = 1
+
+statement ok
+UPDATE item SET qty = DEFAULT WHERE id = 3
+
+query I nosort
+SELECT qty FROM item WHERE id = 3
+----
+1
+
+statement ok
+UPDATE item SET qty = 0
+
+query I nosort
+SELECT sum(qty) FROM item
+----
+0
+
+query IT nosort
+DELETE FROM item WHERE id > 100 RETURNING id, name
+----
+101 BOLT
+102 NUT
+1004 cog
+
+statement ok
+DELETE FROM item WHERE name LIKE 'w%' OR name = 'pin'
+
+query I nosort
+SELECT id FROM item ORDER BY id
+----
+1
+2
+3
+5
+
+statement ok
+DELETE FROM item
+
+query I nosort
+SELECT count(*) FROM item
+----
+0
+
+statement ok
+INSERT INTO item (id, name) VALUES (1, 'bolt again')
+
+query IT nosort
+SELECT id, name FROM item
+----
+1 bolt again
+
+# Composite primary keys.
+statement ok
+CREATE TABLE pair (a INT, b TEXT, v INT, PRIMARY KEY (a, b))
+
+statement ok
+INSERT INTO pair VALUES (1, 'x', 1), (1, 'y', 2), (2, 'x', 3)
+
+statement error 23505
+INSERT INTO pair VALUES (1, 'y', 9)
+
+query I nosort
+SELECT v FROM pair WHERE a = 1 AND b = 'y'
+----
+2
+
+query ITI nosort
+SELECT * FROM pair WHERE a = 1 ORDER BY b DESC
+----
+1 y 2
+1 x 1
+
+statement ok
+UPDATE pair SET b = 'z' WHERE a = 2
+
+query ITI nosort
+SELECT * FROM pair ORDER BY a, b
+----
+1 x 1
+1 y 2
+2 z 3
+
+# Numeric and text primary keys.
+statement ok
+CREATE TABLE price (p NUMERIC(6, 2) PRIMARY KEY, label TEXT)
+
+statement ok
+INSERT INTO price VALUES (1.5, 'a'), (-2, 'b'), (0, 'c'), (10.25, 'd'), (-0.5, 'e')
+
+statement error 23505
+INSERT INTO price VALUES (1.50, 'dup')
+
+query TT nosort
+SELECT p, label FROM price ORDER BY p
+----
+-2.00 b
+-0.50 e
+0.00 c
+1.50 a
+10.25 d
+
+query T nosort
+SELECT label FROM price WHERE p > -1 AND p < 2 ORDER BY p
+----
+e
+c
+a
+
+statement ok
+CREATE TABLE word (w TEXT PRIMARY KEY)
+
+statement ok
+INSERT INTO word VALUES ('b'), ('a'), ('ab'), ('B'), (''), ('a b')
+
+query T nosort
+SELECT w FROM word ORDER BY w
+----
+(empty)
+B
+a
+a b
+ab
+b
+
+query T nosort
+SELECT w FROM word WHERE w >= 'a' AND w < 'b' ORDER BY w
+----
+a
+a b
+ab

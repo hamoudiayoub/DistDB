@@ -1,0 +1,193 @@
+# Tables, rows, and the simplest queries.
+
+statement ok
+CREATE TABLE t (a INT PRIMARY KEY, b TEXT, c INT)
+
+statement ok
+INSERT INTO t VALUES (1, 'one', 10), (2, 'two', 20), (3, 'three', 30)
+
+statement ok
+INSERT INTO t (a, b) VALUES (4, 'four')
+
+statement ok
+INSERT INTO t (c, a, b) VALUES (50, 5, 'five')
+
+query ITI nosort
+SELECT * FROM t ORDER BY a
+----
+1 one 10
+2 two 20
+3 three 30
+4 four NULL
+5 five 50
+
+query IT nosort
+SELECT a, b FROM t WHERE a = 2
+----
+2 two
+
+query T nosort
+SELECT b FROM t WHERE a > 3 ORDER BY a
+----
+four
+five
+
+query I nosort
+SELECT c FROM t WHERE c IS NULL OR c > 25 ORDER BY a
+----
+30
+NULL
+50
+
+query II nosort
+SELECT a, a * 10 + 1 FROM t ORDER BY a DESC
+----
+5 51
+4 41
+3 31
+2 21
+1 11
+
+query T rowsort
+SELECT b AS name FROM t WHERE b LIKE 't%'
+----
+three
+two
+
+query I nosort
+SELECT a FROM t ORDER BY a LIMIT 2
+----
+1
+2
+
+query I nosort
+SELECT a FROM t ORDER BY a LIMIT 2 OFFSET 2
+----
+3
+4
+
+query I nosort
+SELECT a FROM t ORDER BY a OFFSET 3
+----
+4
+5
+
+query I nosort
+SELECT a FROM t ORDER BY a FETCH FIRST 1 ROW ONLY
+----
+1
+
+query IIT nosort
+SELECT 1, 2 + 3, 'x'
+----
+1 5 x
+
+query I nosort
+SELECT count(*) FROM t
+----
+5
+
+query T rowsort
+SELECT DISTINCT substr(b, 1, 1) FROM t
+----
+f
+o
+t
+
+query ITI nosort
+SELECT t.a, t.b, t.c FROM t AS t WHERE t.a BETWEEN 2 AND 4 ORDER BY t.a
+----
+2 two 20
+3 three 30
+4 four NULL
+
+query I nosort
+SELECT a FROM t WHERE a IN (5, 1, 3, 7) ORDER BY a
+----
+1
+3
+5
+
+query I nosort
+SELECT a FROM t WHERE a NOT IN (1, 2) ORDER BY a
+----
+3
+4
+5
+
+query IT nosort
+SELECT x.a, x.b FROM t x WHERE x.a <> 1 AND x.b <> 'two' ORDER BY 1
+----
+3 three
+4 four
+5 five
+
+statement error 42P01
+SELECT * FROM nosuch
+
+statement error 42703
+SELECT nosuch FROM t
+
+statement error 42601
+SELECT FROM WHERE
+
+statement error 42P07
+CREATE TABLE t (x INT)
+
+statement ok
+CREATE TABLE IF NOT EXISTS t (x INT)
+
+statement error 23505
+INSERT INTO t VALUES (1, 'again', 0)
+
+statement error 22P02
+INSERT INTO t VALUES ('one', 'x', 0)
+
+statement ok
+CREATE TABLE "Mixed Case" ("Id" INT PRIMARY KEY, "Value" TEXT)
+
+statement ok
+INSERT INTO "Mixed Case" VALUES (1, 'quoted')
+
+query IT nosort
+SELECT "Id", "Value" FROM "Mixed Case"
+----
+1 quoted
+
+statement ok
+DROP TABLE "Mixed Case"
+
+statement error 42P01
+SELECT * FROM "Mixed Case"
+
+statement ok
+DROP TABLE IF EXISTS "Mixed Case"
+
+# A table without a primary key has a hidden row id.
+statement ok
+CREATE TABLE nokey (v TEXT)
+
+statement ok
+INSERT INTO nokey VALUES ('a'), ('b'), ('a')
+
+query T rowsort
+SELECT * FROM nokey
+----
+a
+a
+b
+
+query I nosort
+SELECT count(*) FROM nokey WHERE v = 'a'
+----
+2
+
+# Comments and several statements in one string.
+statement ok
+INSERT INTO nokey VALUES ('c'); -- a comment
+INSERT INTO nokey VALUES ('d') /* another */
+
+query I nosort
+SELECT count(*) FROM nokey
+----
+5

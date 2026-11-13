@@ -11,6 +11,7 @@ import io.distdb.kv.Ranges;
 import io.distdb.kv.ReplicatedKv;
 import io.distdb.kv.Store;
 import io.distdb.pd.PlacementDriver;
+import io.distdb.pgwire.PgServer;
 import io.distdb.rpc.PdClient;
 import io.distdb.rpc.grpc.GrpcKvChannel;
 import io.distdb.rpc.grpc.GrpcKvServer;
@@ -19,6 +20,9 @@ import io.distdb.rpc.proto.ListRangesRequest;
 import io.distdb.rpc.proto.ListRangesResponse;
 import io.distdb.rpc.proto.PdRequest;
 import io.distdb.rpc.proto.RangeInfo;
+import io.distdb.sql.Engine;
+import io.distdb.sql.kv.Awaiter;
+import io.distdb.sql.kv.TxnKvStore;
 import io.distdb.storage.lsm.EngineOptions;
 import io.distdb.storage.lsm.LsmEngine;
 import io.distdb.txn.GcWorker;
@@ -99,7 +103,41 @@ final class ShardedCommands {
             SystemClock.INSTANCE,
             transport.service());
     store.start();
+    // SQL: a PostgreSQL wire server whose sessions run Phase 7 transactions through this node.
+    String sqlText = args.option("sql", null);
+    PgServer sql = null;
+    if (sqlText != null) {
+      Args.HostPort sqlAt = Args.hostPort(sqlText);
+      KvClient kv =
+          new KvClient(
+              pd,
+              GrpcKvChannel::connect,
+              SystemClock.INSTANCE,
+              scheduler,
+              SplittableRandomSource.fromEntropy(),
+              ClientOptions.defaults());
+      TxnClient txn =
+          new TxnClient(
+              kv,
+              pd,
+              SystemClock.INSTANCE,
+              scheduler,
+              SplittableRandomSource.fromEntropy(),
+              TxnClient.Options.defaults());
+      sql =
+          PgServer.start(
+              new InetSocketAddress(sqlAt.host(), sqlAt.port()),
+              new Engine(new TxnKvStore(txn, Awaiter.blocking())));
+    }
+    PgServer sqlServer = sql;
     onShutdown(() -> {
+      if (sqlServer != null) {
+        try {
+          sqlServer.close();
+        } catch (IOException ignored) {
+          // shutting down anyway
+        }
+      }
       server.close();
       store.close();
       pd.close();
@@ -117,7 +155,10 @@ final class ShardedCommands {
             + self.value()
             + " (data in "
             + dataDir
-            + ")");
+            + ")"
+            + (sqlServer == null
+                ? ""
+                : ", SQL on " + Args.hostPort(sqlText).host() + ":" + sqlServer.port()));
     out.flush();
     server.awaitTermination();
     return 0;

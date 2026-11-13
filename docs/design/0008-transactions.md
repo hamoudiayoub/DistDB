@@ -132,6 +132,10 @@ range as a scan does (so splits during the walk are handled the usual way):
 
 A transaction older than the lifetime fails and must start again: the price of a bounded history.
 
+*Since Phase 8:* steps 1 and 2 are `TxnClient.fence(ts)`, which schema changes also use (with `ts` the
+commit of the new schema; see 0009). And `Txn.scan` stops reading at its limit (plus one entry per
+own write in the span, since each can hide one), so the SQL layer can scan page by page.
+
 ## Verification (the Phase 7 gate)
 
 **`BankSimulationTest`** runs Phase 6's cluster with bank clients instead of single-key ones. The

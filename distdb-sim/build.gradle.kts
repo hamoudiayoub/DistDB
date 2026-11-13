@@ -5,8 +5,11 @@ dependencies {
   implementation(project(":distdb-kv"))
   implementation(project(":distdb-pd"))
   implementation(project(":distdb-txn"))
+  implementation(project(":distdb-sql"))
   implementation(project(":distdb-pgwire"))
   // The simulated clock, scheduler and file system.
   implementation(testFixtures(project(":distdb-env")))
   testImplementation(libs.archunit.junit5)
+  // The sqllogictest files and their runner.
+  testImplementation(testFixtures(project(":distdb-sql")))
 }

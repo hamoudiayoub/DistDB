@@ -1,0 +1,121 @@
+# Transactions in one session: BEGIN, COMMIT, ROLLBACK, and aborted blocks.
+
+statement ok
+CREATE TABLE bank (id INT PRIMARY KEY, bal INT NOT NULL)
+
+statement ok
+INSERT INTO bank VALUES (1, 100), (2, 50)
+
+statement ok
+BEGIN
+
+statement ok
+UPDATE bank SET bal = bal - 30 WHERE id = 1
+
+statement ok
+UPDATE bank SET bal = bal + 30 WHERE id = 2
+
+query II nosort
+SELECT id, bal FROM bank ORDER BY id
+----
+1 70
+2 80
+
+statement ok
+ROLLBACK
+
+query II nosort
+SELECT id, bal FROM bank ORDER BY id
+----
+1 100
+2 50
+
+statement ok
+BEGIN
+
+statement ok
+UPDATE bank SET bal = bal - 30 WHERE id = 1
+
+statement ok
+INSERT INTO bank VALUES (3, 30)
+
+query I nosort
+SELECT sum(bal) FROM bank
+----
+150
+
+statement ok
+COMMIT
+
+query II nosort
+SELECT id, bal FROM bank ORDER BY id
+----
+1 70
+2 50
+3 30
+
+statement ok
+START TRANSACTION
+
+statement ok
+DELETE FROM bank WHERE id = 3
+
+statement error 22012
+SELECT 1 / 0
+
+statement error 25P02
+SELECT * FROM bank
+
+statement ok
+COMMIT
+
+query I nosort
+SELECT count(*) FROM bank
+----
+3
+
+statement ok
+BEGIN
+
+statement error 23505
+INSERT INTO bank VALUES (1, 0)
+
+statement ok
+ROLLBACK
+
+statement ok
+BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ
+
+statement ok
+CREATE TABLE made_in_txn (x INT)
+
+statement ok
+INSERT INTO made_in_txn VALUES (1)
+
+query I nosort
+SELECT x FROM made_in_txn
+----
+1
+
+statement ok
+ROLLBACK
+
+statement error 42P01
+SELECT * FROM made_in_txn
+
+statement ok
+BEGIN
+
+statement ok
+CREATE TABLE kept (x INT)
+
+statement ok
+INSERT INTO kept VALUES (1), (2)
+
+statement ok
+COMMIT
+
+query I nosort
+SELECT count(*) FROM kept
+----
+2

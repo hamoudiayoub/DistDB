@@ -380,3 +380,138 @@ One entry per bug that took more than an hour: symptom, root cause, what it taug
 - **Lesson:** the timestamp oracle is a single point of *availability* (never of safety). Systems
   built on Percolator work around it: batching (done here), caching a lease, or hybrid logical
   clocks instead of a central oracle (CockroachDB's choice).
+
+---
+
+## 2026-11-12 — A schema change is write skew: an index lost a writer's row
+
+- **Symptom:** none yet, by design: the hazard was found on paper, then planted to see the gate
+  catch it. With `CREATE INDEX` as one transaction (add the index, scan the table, write the
+  entries), the SQL bank simulation failed at seed 21: "for owner o1 the index found 3 rows, a full
+  scan 4".
+- **Cause:** a writer that started before the index existed read the old schema and inserted a
+  row without an entry; the index's transaction read the table before that row committed. They
+  wrote different keys, so snapshot isolation let both commit. The writer read the schema and wrote
+  rows; the schema change read rows and wrote the schema: write skew.
+- **Fix:** F1's idea with Phase 7's tool. The index is first added WRITE_ONLY (writers maintain
+  it, readers ignore it) and committed at `C1`. Then a **fence**: every range's floor goes to
+  `C1` and every lock below it is resolved, so no transaction that started with the old schema can
+  still commit. Only then the backfill, and the index goes PUBLIC. `TxnClient.fence` is the GC
+  worker's floor-and-resolve walk, now shared.
+- **Lesson:** under snapshot isolation, "read A, write B" against "read B, write A" is a race, even
+  when one side is the schema. Leases (F1, CockroachDB) bound how long an old schema lives; DistDB
+  already had a bound, the transaction floor, and only had to use it.
+
+---
+
+## 2026-11-12 — A rolled-back CREATE TABLE poisoned the catalog cache
+
+- **Symptom:** `transaction.test` failed: after `BEGIN; CREATE TABLE made_in_txn ...; ROLLBACK`,
+  the next transaction's `CREATE TABLE kept` succeeded, but its `INSERT INTO kept` said the
+  relation did not exist.
+- **Cause:** catalog versions were a counter, and the cache was keyed by version. The rolled-back
+  transaction had read its own uncommitted version `v+1` and cached its snapshot (with the table
+  that never was). The next schema change also produced `v+1`, and found the stale snapshot.
+- **Fix:** a version is now the start timestamp of the transaction that wrote it (unique, and
+  increasing in commit order since two schema changes conflict on the version key), and a
+  transaction never caches a version it wrote itself.
+- **Lesson:** a cache key must name one state. "Version 5" named two different catalogs, one of
+  which was never committed.
+
+---
+
+## 2026-11-12 — PostgreSQL as the oracle: three differences it caught at once
+
+Recording the sqllogictest files from a real PostgreSQL 18 and running them on DistDB found, in the
+first run:
+
+- **NUMERIC lost its scale on disk:** `7` stored in a `NUMERIC(6,2)` column read back as `7`,
+  not `7.00`. Row values reused the key encoding, which strips trailing zeros so that `1.0` and
+  `1.00` are one key. Values now keep the scale; keys still don't.
+- **`position('l' IN 'hello')` was a syntax error:** the first argument was parsed as a full
+  expression, so `IN` became the IN operator. It now stops below IN's binding power.
+- **`SELECT 1 UNION SELECT 'x'` gave the wrong error:** the select list typed `'x'` as text at
+  once, so the union failed with 42804 (types do not match). PostgreSQL keeps it unknown until the
+  union types it as integer, and fails with 22P02 (not a number). Untyped literals now stay
+  UNKNOWN until the query's output is final.
+- **Lesson:** writing expected results by hand would have encoded my own assumptions. A reference
+  implementation finds the assumptions.
+
+---
+
+## 2026-11-12 — `scan(limit 0)` meant "no limit" in one layer and "nothing" in another
+
+- **Symptom:** every sqllogictest file passed on the in-memory store, and the first one failed on
+  the simulated cluster: `CREATE TABLE t` succeeded, then `INSERT INTO t` said "relation does not
+  exist".
+- **Cause:** the catalog loads every descriptor with `scan(start, end, 0)`. The SQL layer's
+  `KvTxn` contract says 0 means no limit; Phase 7's `Txn.scan` returned the first 0 entries.
+- **Fix:** the adapter translates 0 to "unlimited".
+- **Lesson:** a sentinel value is a contract between two layers, and only one of them had read
+  it. The in-memory store implemented the SQL layer's version of the contract, so only the real
+  cluster could find this.
+
+---
+
+## 2026-11-12 — Three lost messages in a row on a fault-free cluster
+
+- **Symptom:** on the simulated cluster with no faults injected, one scan in `aggregate.test`
+  failed with "deadline exceeded after 3 attempts: no answer", on every run.
+- **Cause:** not a bug. The simulated network drops 2% of messages even when the test injects no
+  faults. This scan's request was dropped, then both retries' replies (traced at the leader: it
+  answered each in 3 ms). A one-in-a-hundred-thousand event, reproduced exactly because the run is
+  deterministic.
+- **Fix:** Phase 7 reports such a failure as FAILED: "nothing answered in time; no write happened".
+  The SQL layer now marks it retryable, so an autocommit statement runs again, as for 40001.
+- **Lesson:** "safe to retry" is a property of what happened (nothing was written), not of the
+  error's code. The error carries it as a flag.
+
+---
+
+## 2026-11-12 — Waiting by running the world starved the sessions
+
+- **Symptom:** the first SQL bank runs did almost nothing: 12 transfers in 3 seeds, for 198 power
+  cuts.
+- **Cause:** a design flaw in the simulation. Each session's statement waited by running the
+  simulated world, and the world included other sessions' statements, which then ran *nested
+  inside* the first one's wait. A session whose answer had come could not return until every
+  statement started on top of it finished, and they kept starting new ones.
+- **Fix:** `SimFibers`. Each session is a thread that runs only while the simulation's thread waits
+  for it, so one thread runs at a time and the run stays deterministic. A session that waits for a
+  future hands control back. When the future completes, a simulation task hands control to the
+  session again. Sessions now interleave at every wait, with no nesting.
+- **Lesson:** blocking code can live inside a deterministic simulator, but only as coroutines,
+  never as nested event loops. With one stack for many logical threads, the last one to start
+  decides when the others finish.
+
+---
+
+## 2026-11-12 — A unique index under construction already enforces uniqueness
+
+- **Symptom:** SQL bank seed 28 failed: an owner change got 23505 from `accounts_owner_unique`,
+  an index the admin session was building at that moment (and which was bound to fail, as owners
+  repeat).
+- **Cause:** not a bug. A WRITE_ONLY unique index is maintained by writers, and maintaining a unique
+  entry means checking it is free. PostgreSQL behaves the same way: an unfinished `CREATE UNIQUE
+  INDEX CONCURRENTLY` keeps enforcing uniqueness on new writes.
+- **Fix:** the simulation accepts 23505 from that index (and from no other).
+- **Lesson:** the states of a schema change are visible to every writer. "Writers maintain it" for
+  a unique index includes "writers may be refused".
+
+---
+
+## 2026-11-12 — A planted bug survived because the workload never did that
+
+- **Symptom:** planting "inserts skip WRITE_ONLY indexes" (P2) broke nothing: unit tests and 60
+  SQL bank seeds all passed. So did planting "the fence raises floors but resolves no locks"
+  (P10).
+- **Cause:** for P2, a gap in the workload: the bank only *updated* rows, and updates maintain
+  every index correctly. No insert ever ran while an index was being built. For P10, a narrow race:
+  an old transaction must lock its keys before the floor reaches its range, then commit after the
+  backfill's snapshot, and sixty seeds never lined that up.
+- **Fix:** the bank now opens and closes empty accounts (inserts and deletes), and seed 8 caught
+  P2. `FenceTest` now states the fence's contract directly: a transaction that prewrote before the
+  fence must not commit after it. It caught P10 at once.
+- **Lesson:** a planted bug that survives says what the tests never do. Two remedies: widen the
+  workload when the gap is an operation it skips; write a targeted test when the gap is timing
+  that random runs rarely line up.

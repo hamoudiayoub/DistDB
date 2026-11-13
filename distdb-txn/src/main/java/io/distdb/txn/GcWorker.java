@@ -1,18 +1,10 @@
 package io.distdb.txn;
 
-import com.google.protobuf.ByteString;
 import io.distdb.env.Scheduler;
 import io.distdb.rpc.PdClient;
-import io.distdb.rpc.proto.KvRequest;
-import io.distdb.rpc.proto.KvResponse;
-import io.distdb.rpc.proto.LockInfo;
 import io.distdb.rpc.proto.PdRequest;
-import io.distdb.rpc.proto.ScanLocksRequest;
 import io.distdb.rpc.proto.SetGcSafePointRequest;
-import io.distdb.rpc.proto.SetTxnFloorRequest;
 import java.time.Duration;
-import java.util.ArrayList;
-import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.function.BooleanSupplier;
@@ -26,7 +18,8 @@ import java.util.function.BooleanSupplier;
  *       G}. After the walk, no new lock below {@code G} can appear anywhere (a range split since
  *       inherits the floor).
  *   <li><b>Resolve.</b> Walk every range again for locks below {@code G}, and resolve them. Their
- *       transactions outlived the lifetime: those that did not commit are rolled back.
+ *       transactions outlived the lifetime: those that did not commit are rolled back. (Steps 1 and
+ *       2 are {@link TxnClient#fence(long)}.)
  *   <li><b>Safe point.</b> Give {@code G} to the placement driver, which passes it on to the
  *       stores, whose ranges drop the versions no read at {@code G} or later can see.
  * </ol>
@@ -108,8 +101,7 @@ public final class GcWorker {
           if (g <= lastSafePoint) {
             return CompletableFuture.completedFuture(lastSafePoint);
           }
-          return floor(new byte[0], g)
-              .thenCompose(v -> resolve(new byte[0], g))
+          return txn.fence(g)
               .thenCompose(v ->
                   pd.call(
                       PdRequest.newBuilder()
@@ -124,76 +116,6 @@ public final class GcWorker {
                 }
                 return safePoint;
               });
-        });
-  }
-
-  /** Step 1, from {@code key} to the end of the key space, one range at a time. */
-  private CompletableFuture<Void> floor(byte[] key, long g) {
-    KvRequest request =
-        KvRequest.newBuilder()
-            .setSetTxnFloor(
-                SetTxnFloorRequest.newBuilder().setKey(ByteString.copyFrom(key)).setFloor(g))
-            .build();
-    return txn.send(request)
-        .thenCompose(r -> {
-          if (!r.hasSetTxnFloor()) {
-            return CompletableFuture.failedFuture(
-                new IllegalStateException("floor not set: " + r.getError().getMessage()));
-          }
-          if (!r.getSetTxnFloor().hasRangeEnd()) {
-            return CompletableFuture.completedFuture(null);
-          }
-          return floor(r.getSetTxnFloor().getRangeEnd().toByteArray(), g);
-        });
-  }
-
-  /** Step 2, from {@code key} to the end of the key space. */
-  private CompletableFuture<Void> resolve(byte[] key, long g) {
-    KvRequest request =
-        KvRequest.newBuilder()
-            .setScanLocks(
-                ScanLocksRequest.newBuilder()
-                    .setStartKey(ByteString.copyFrom(key))
-                    .setMaxTs(g)
-                    .setLimit(256))
-            .build();
-    return txn.send(request)
-        .thenCompose(r -> {
-          if (!r.hasScanLocks()) {
-            return CompletableFuture.failedFuture(
-                new IllegalStateException("locks not scanned: " + r.getError().getMessage()));
-          }
-          List<CompletableFuture<Boolean>> resolving = new ArrayList<>();
-          for (LockInfo lock : r.getScanLocks().getLocksList()) {
-            resolving.add(resolveFully(lock, 0));
-          }
-          return CompletableFuture.allOf(resolving.toArray(CompletableFuture[]::new))
-              .thenCompose(v -> next(r, g));
-        });
-  }
-
-  private CompletableFuture<Void> next(KvResponse r, long g) {
-    if (!r.getScanLocks().hasResumeKey()) {
-      return CompletableFuture.completedFuture(null);
-    }
-    return resolve(r.getScanLocks().getResumeKey().toByteArray(), g);
-  }
-
-  /**
-   * Resolves {@code lock} until it is gone. Its primary's range has a floor above it, so the
-   * primary answers committed or rolled back, never "still running"; a retry covers a primary in a
-   * range that had not applied its floor yet.
-   */
-  private CompletableFuture<Boolean> resolveFully(LockInfo lock, int attempt) {
-    return txn.resolve(lock)
-        .thenCompose(gone -> {
-          if (gone || attempt >= 20) {
-            return gone
-                ? CompletableFuture.completedFuture(true)
-                : CompletableFuture.<Boolean>failedFuture(
-                    new IllegalStateException("a lock below the safe point would not go"));
-          }
-          return txn.later(Duration.ofMillis(50)).thenCompose(v -> resolveFully(lock, attempt + 1));
         });
   }
 }

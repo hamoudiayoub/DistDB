@@ -1,0 +1,154 @@
+# Aggregation and grouping.
+
+statement ok
+CREATE TABLE sales (id INT PRIMARY KEY, region TEXT, product TEXT, qty INT, price NUMERIC(8, 2))
+
+statement ok
+INSERT INTO sales VALUES
+  (1, 'north', 'apple', 10, 1.50),
+  (2, 'north', 'pear', 5, 2.25),
+  (3, 'south', 'apple', 7, 1.40),
+  (4, 'south', 'apple', 3, 1.60),
+  (5, 'east', 'kiwi', 12, 0.80),
+  (6, 'north', 'apple', 1, 1.55),
+  (7, 'east', NULL, 4, 3.00)
+
+query IIIII nosort
+SELECT count(*), sum(qty), min(qty), max(qty), count(product) FROM sales
+----
+7 42 1 12 6
+
+query T nosort
+SELECT avg(qty) FROM sales
+----
+6.0000000000000000
+
+query TTT nosort
+SELECT sum(price), avg(price), sum(qty * price) FROM sales
+----
+12.10 1.7285714285714286 64.00
+
+query TI rowsort
+SELECT region, sum(qty) FROM sales GROUP BY region
+----
+east 16
+north 16
+south 10
+
+query TTI rowsort
+SELECT region, product, count(*) FROM sales GROUP BY region, product
+----
+east NULL 1
+east kiwi 1
+north apple 2
+north pear 1
+south apple 2
+
+query TI nosort
+SELECT region, sum(qty) AS total FROM sales GROUP BY region ORDER BY total DESC
+----
+north 16
+east 16
+south 10
+
+query TI nosort
+SELECT region, count(*) FROM sales GROUP BY 1 HAVING count(*) > 2 ORDER BY 1
+----
+north 3
+
+query TT nosort
+SELECT region, max(price) - min(price) FROM sales GROUP BY region HAVING sum(qty) >= 10 ORDER BY region
+----
+east 2.20
+north 0.75
+south 0.20
+
+query I nosort
+SELECT count(DISTINCT region) FROM sales
+----
+3
+
+query TII rowsort
+SELECT product, count(DISTINCT region), sum(DISTINCT qty) FROM sales GROUP BY product
+----
+NULL 1 4
+apple 2 21
+kiwi 1 12
+pear 1 5
+
+query IT rowsort
+SELECT qty / 5, count(*) FROM sales GROUP BY qty / 5
+----
+0 3
+1 2
+2 2
+
+query T rowsort
+SELECT upper(region) FROM sales GROUP BY region
+----
+EAST
+NORTH
+SOUTH
+
+query TI nosort
+SELECT region AS r, sum(qty) FROM sales GROUP BY r ORDER BY r
+----
+east 16
+north 16
+south 10
+
+query I nosort
+SELECT sum(qty) FROM sales HAVING sum(qty) > 0
+----
+42
+
+query I nosort
+SELECT count(*) FROM sales HAVING count(*) > 100
+----
+
+query TT nosort
+SELECT min(product), max(product) FROM sales
+----
+apple pear
+
+query R nosort
+SELECT avg(qty::float8) FROM sales
+----
+6.000
+
+query TTI nosort
+SELECT region, product, sum(qty) FROM sales WHERE price > 1 GROUP BY region, product ORDER BY region, product
+----
+east NULL 4
+north apple 11
+north pear 5
+south apple 10
+
+query I nosort
+SELECT max(c) FROM (SELECT region, count(*) AS c FROM sales GROUP BY region) t
+----
+3
+
+statement error 42803
+SELECT region, qty FROM sales GROUP BY region
+
+statement error 42803
+SELECT sum(qty) FROM sales WHERE sum(qty) > 1
+
+statement error 42803
+SELECT sum(max(qty)) FROM sales
+
+statement error 42803
+SELECT id, count(*) FROM sales
+
+statement ok
+CREATE TABLE empty (v INT)
+
+query IIT nosort
+SELECT count(*), sum(v), avg(v) FROM empty
+----
+0 NULL NULL
+
+query I nosort
+SELECT count(*) FROM empty GROUP BY v
+----

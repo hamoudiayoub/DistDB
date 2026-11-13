@@ -1,0 +1,120 @@
+# UNION, INTERSECT and EXCEPT.
+
+statement ok
+CREATE TABLE l (v INT)
+
+statement ok
+CREATE TABLE r (v INT)
+
+statement ok
+INSERT INTO l VALUES (1), (2), (2), (3), (NULL)
+
+statement ok
+INSERT INTO r VALUES (2), (3), (3), (4), (NULL)
+
+query I rowsort
+SELECT v FROM l UNION SELECT v FROM r
+----
+1
+2
+3
+4
+NULL
+
+query I rowsort
+SELECT v FROM l UNION ALL SELECT v FROM r
+----
+1
+2
+2
+2
+3
+3
+3
+4
+NULL
+NULL
+
+query I rowsort
+SELECT v FROM l INTERSECT SELECT v FROM r
+----
+2
+3
+NULL
+
+query I rowsort
+SELECT v FROM l INTERSECT ALL SELECT v FROM r
+----
+2
+3
+NULL
+
+query I rowsort
+SELECT v FROM l EXCEPT SELECT v FROM r
+----
+1
+
+query I rowsort
+SELECT v FROM l EXCEPT ALL SELECT v FROM r
+----
+1
+2
+
+query I rowsort
+SELECT v FROM r EXCEPT ALL SELECT v FROM l
+----
+3
+4
+
+query I nosort
+SELECT v FROM l UNION SELECT v FROM r ORDER BY v DESC NULLS LAST LIMIT 3
+----
+4
+3
+2
+
+query I nosort
+SELECT v FROM l UNION SELECT v FROM r ORDER BY 1 LIMIT 2 OFFSET 1
+----
+2
+3
+
+query T rowsort
+SELECT 1 UNION SELECT 2.5
+----
+1
+2.5
+
+query T rowsort
+SELECT 'a' UNION SELECT 'b' UNION SELECT 'a'
+----
+a
+b
+
+query I rowsort
+(SELECT v FROM l WHERE v > 1) UNION ALL (SELECT v FROM r WHERE v < 3)
+----
+2
+2
+2
+3
+
+query I rowsort
+SELECT v FROM l UNION SELECT v FROM r INTERSECT SELECT v FROM r WHERE v > 3
+----
+1
+2
+3
+4
+NULL
+
+query I nosort
+SELECT count(*) FROM (SELECT v FROM l UNION SELECT v FROM r) u
+----
+5
+
+statement error 42601
+SELECT 1, 2 UNION SELECT 3
+
+statement error 22P02
+SELECT 1 UNION SELECT 'x'

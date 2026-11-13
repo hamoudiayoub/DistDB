@@ -1,0 +1,194 @@
+# Values, operators, casts and functions, printed exactly as PostgreSQL prints them.
+
+query IIIII nosort
+SELECT 7 / 2, -7 / 2, 7 % 3, -7 % 3, 2 * -3
+----
+3 -3 1 -1 -6
+
+query TTTT nosort
+SELECT 1.5 + 1, 1.5 * 2, 10 / 4.0, 1 / 3.0
+----
+2.5 3.0 2.5000000000000000 0.33333333333333333333
+
+query TTT nosort
+SELECT 0.1 + 0.2, 1.50, 1e3
+----
+0.3 1.50 1000
+
+query TTTT nosort
+SELECT 100000 / 7.0, 0.0001 / 3, 123456789 / 0.001, 2.50 * 1.5
+----
+14285.714285714286 0.000033333333333333333333 123456789000.00000000 3.750
+
+query TTTT nosort
+SELECT 0.1::float8 + 0.2::float8, 1e15::float8, 1e14::float8, 0.00001::float8
+----
+0.30000000000000004 1e+15 100000000000000 1e-05
+
+query TTT nosort
+SELECT 7::float8 / 2, 1::float8 / 3, -2.5::float8
+----
+3.5 0.3333333333333333 -2.5
+
+query TTTT nosort
+SELECT round(2.5), round(-2.5), round(2.5::float8), round(3.5::float8)
+----
+3 -3 2 4
+
+query TTT nosort
+SELECT round(3.14159, 2), round(1234.5, -2), trunc(3.789, 1)
+----
+3.14 1200 3.7
+
+query TTTT nosort
+SELECT ceil(4.2), floor(-4.2), ceil(5), abs(-3)
+----
+5 -5 5 3
+
+query TTT nosort
+SELECT abs(-2.5), sqrt(16), power(2, 10)
+----
+2.5 4 1024
+
+query TTTT nosort
+SELECT CAST(2.5 AS INT), CAST(3.5 AS INT), CAST(-2.5 AS INT), CAST(2.5::float8 AS INT)
+----
+3 4 -3 2
+
+query TTTT nosort
+SELECT '12'::int + 1, CAST(' 42 ' AS INT), CAST('1.50' AS NUMERIC), CAST(12 AS TEXT)
+----
+13 42 1.50 12
+
+query TTT nosort
+SELECT 0.1::float8::numeric, (1::float8 / 3)::numeric, 7::numeric / 2
+----
+0.1 0.333333333333333 3.5000000000000000
+
+query TTTT nosort
+SELECT true, false, 't'::boolean, 'off'::boolean
+----
+t f t f
+
+query TTTT nosort
+SELECT 1 < 2, 'abc' < 'abd', 'B' < 'a', 2.5 = 2.50
+----
+t t t t
+
+query TTT nosort
+SELECT 'abc' || 'def', 'a' || 1, 1 || 'a'
+----
+abcdef a1 1a
+
+query TTTTT nosort
+SELECT length('hello'), upper('hello'), lower('HeLLo'), substr('hello', 2, 3), substr('hello', -1, 3)
+----
+5 HELLO hello ell h
+
+query TTTT nosort
+SELECT replace('banana', 'an', 'AN'), trim('  pad  '), ltrim('xxhixx', 'x'), rtrim('xxhixx', 'x')
+----
+bANANa pad hixx xxhi
+
+query TTTT nosort
+SELECT left('hello', 2), right('hello', 3), strpos('hello', 'll'), position('l' in 'hello')
+----
+he llo 3 3
+
+query TTT nosort
+SELECT concat('a', 1, NULL, 2.5), repeat('ab', 3), reverse('abc')
+----
+a12.5 ababab cba
+
+query TTTT nosort
+SELECT coalesce(NULL, 2, 3), nullif(1, 1), nullif(1, 2), greatest(1, 5, 3)
+----
+2 NULL 1 5
+
+query TT nosort
+SELECT least(3, 2.5), greatest('apple', 'banana')
+----
+2.5 banana
+
+query TTT nosort
+SELECT CASE WHEN 1 > 2 THEN 'a' WHEN 2 > 1 THEN 'b' ELSE 'c' END, CASE 3 WHEN 1 THEN 'one' WHEN 3 THEN 'three' END, CASE WHEN false THEN 1 END
+----
+b three NULL
+
+query TTTT nosort
+SELECT 'abc' LIKE 'a%', 'abc' LIKE '_b_', 'abc' NOT LIKE '%d', 'ABC' ILIKE 'a%'
+----
+t t t t
+
+query TT nosort
+SELECT 'a%c' LIKE 'a\%c', '50%' LIKE '50!%' ESCAPE '!'
+----
+t t
+
+query TT nosort
+SELECT 2 ^ 3, mod(17, 5)
+----
+8 2
+
+query T nosort
+SELECT -(-5)
+----
+5
+
+statement error 22012
+SELECT 1 / 0
+
+statement error 22012
+SELECT 1.0 / 0
+
+statement error 22012
+SELECT 1 % 0
+
+statement error 22P02
+SELECT 'x'::int
+
+statement error 22P02
+SELECT 1 + 'a'
+
+statement error 42883
+SELECT true + 1
+
+statement error 42883
+SELECT 'a'::text = 1
+
+statement error 22P02
+SELECT 'maybe'::boolean
+
+statement ok
+CREATE TABLE nums (id INT PRIMARY KEY, n NUMERIC(6, 2), f DOUBLE PRECISION, s VARCHAR(5))
+
+statement ok
+INSERT INTO nums VALUES (1, 1.005, 1.5, 'abc'), (2, 123.456, 0.1, 'abcde'), (3, 7, -0.25, '')
+
+query ITTT nosort
+SELECT id, n, f, s FROM nums ORDER BY id
+----
+1 1.01 1.5 abc
+2 123.46 0.1 abcde
+3 7.00 -0.25 (empty)
+
+query TTT nosort
+SELECT sum(n), avg(n), sum(f) FROM nums
+----
+131.47 43.8233333333333333 1.35
+
+statement error 22003
+INSERT INTO nums VALUES (4, 12345.6, 0, 'x')
+
+statement error 22001
+INSERT INTO nums VALUES (5, 1, 0, 'toolong')
+
+query T nosort
+SELECT 'abcdef'::varchar(3)
+----
+abc
+
+query TT nosort
+SELECT n * 2, n / 3 FROM nums WHERE id = 3
+----
+14.00 2.3333333333333333

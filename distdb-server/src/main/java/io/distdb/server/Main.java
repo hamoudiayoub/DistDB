@@ -25,8 +25,10 @@ public final class Main {
             Run node N of the placement driver; it listens on its own entry in --peers.
 
         distdb node --data-dir DIR --id N --listen HOST:PORT --pd PD_ADDRESSES [--founders 1,2,3]
+                    [--sql HOST:PORT]
             Run data node N. The founders create the first range when the cluster is new;
             the placement driver then splits ranges and spreads them over all data nodes.
+            With --sql, the node also serves SQL to PostgreSQL clients (psql, JDBC) there.
 
         distdb ranges --pd PD_ADDRESSES
             Print every range: its span, epoch, replicas and leader.

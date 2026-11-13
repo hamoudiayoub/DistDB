@@ -1,0 +1,202 @@
+# Filters, ordering, derived tables, CTEs and VALUES.
+
+statement ok
+CREATE TABLE emp (id INT PRIMARY KEY, name TEXT NOT NULL, dept TEXT, salary INT, manager INT)
+
+statement ok
+INSERT INTO emp VALUES
+  (1, 'alice', 'eng', 120, NULL),
+  (2, 'bob', 'eng', 100, 1),
+  (3, 'carol', 'sales', 90, 1),
+  (4, 'dave', 'sales', 85, 3),
+  (5, 'erin', 'eng', 110, 1),
+  (6, 'frank', 'ops', 70, 1),
+  (7, 'grace', NULL, 95, 5),
+  (8, 'heidi', 'ops', 72, 6)
+
+query IT nosort
+SELECT id, name FROM emp WHERE id >= 3 AND id < 6 ORDER BY id
+----
+3 carol
+4 dave
+5 erin
+
+query IT nosort
+SELECT id, name FROM emp WHERE id > 6 ORDER BY id
+----
+7 grace
+8 heidi
+
+query IT nosort
+SELECT id, name FROM emp WHERE id <= 2 ORDER BY id DESC
+----
+2 bob
+1 alice
+
+query T nosort
+SELECT name FROM emp WHERE salary BETWEEN 85 AND 100 ORDER BY salary
+----
+dave
+carol
+grace
+bob
+
+query T nosort
+SELECT name FROM emp WHERE salary NOT BETWEEN 85 AND 110 ORDER BY name
+----
+alice
+frank
+heidi
+
+query TTI nosort
+SELECT dept, name, salary FROM emp ORDER BY dept, salary DESC
+----
+eng alice 120
+eng erin 110
+eng bob 100
+ops heidi 72
+ops frank 70
+sales carol 90
+sales dave 85
+NULL grace 95
+
+query TI nosort
+SELECT name, salary FROM emp ORDER BY salary - id * 10, name LIMIT 3
+----
+heidi 72
+frank 70
+grace 95
+
+query TI nosort
+SELECT name AS n, salary AS s FROM emp ORDER BY s DESC LIMIT 2
+----
+alice 120
+erin 110
+
+query T nosort
+SELECT name FROM emp ORDER BY 1 LIMIT 3
+----
+alice
+bob
+carol
+
+query T nosort
+SELECT upper(name) FROM emp WHERE dept = 'ops' ORDER BY id
+----
+FRANK
+HEIDI
+
+query T nosort
+SELECT name FROM emp WHERE name LIKE '%a%' AND salary > 80 ORDER BY name
+----
+alice
+carol
+dave
+grace
+
+query T rowsort
+SELECT DISTINCT dept FROM emp
+----
+NULL
+eng
+ops
+sales
+
+query TI nosort
+SELECT DISTINCT dept, salary / 10 FROM emp ORDER BY dept, salary / 10
+----
+eng 10
+eng 11
+eng 12
+ops 7
+sales 8
+sales 9
+NULL 9
+
+query TI nosort
+SELECT name, (SELECT count(*) FROM emp) FROM emp WHERE id = 1
+----
+alice 8
+
+query II nosort
+SELECT d.id, d.double FROM (SELECT id, salary * 2 AS double FROM emp) d WHERE d.double > 200 ORDER BY d.id
+----
+1 240
+5 220
+
+query TI nosort
+SELECT x.dept, x.total FROM (SELECT dept, sum(salary) AS total FROM emp GROUP BY dept) AS x WHERE x.total > 150 ORDER BY x.dept
+----
+eng 330
+sales 175
+
+query I nosort
+WITH rich AS (SELECT * FROM emp WHERE salary >= 100) SELECT count(*) FROM rich
+----
+3
+
+query TT nosort
+WITH a AS (SELECT name, dept FROM emp WHERE dept = 'eng'), b AS (SELECT name FROM a WHERE name > 'b') SELECT b.name, a.dept FROM b JOIN a ON a.name = b.name ORDER BY 1
+----
+bob eng
+erin eng
+
+query IT nosort
+SELECT * FROM (VALUES (1, 'one'), (2, 'two'), (3, 'three')) AS v(n, word) WHERE n > 1 ORDER BY n
+----
+2 two
+3 three
+
+query T nosort
+SELECT column2 FROM (VALUES (1, 'x'), (2, 'y')) v ORDER BY column1 DESC
+----
+y
+x
+
+query I nosort
+VALUES (3), (1), (2)
+----
+3
+1
+2
+
+query I nosort
+SELECT n FROM (VALUES (5), (3), (9)) AS t(n) ORDER BY n DESC LIMIT 1
+----
+9
+
+query TI nosort
+SELECT name, salary FROM emp WHERE salary = (SELECT max(salary) FROM emp)
+----
+alice 120
+
+query T nosort
+SELECT name FROM emp WHERE dept IS NULL
+----
+grace
+
+query TI nosort
+SELECT name, CASE WHEN salary >= 100 THEN 1 ELSE 0 END FROM emp ORDER BY id LIMIT 4
+----
+alice 1
+bob 1
+carol 0
+dave 0
+
+statement error 42P10
+SELECT name FROM emp ORDER BY 3
+
+statement error 42P10
+SELECT DISTINCT dept FROM emp ORDER BY salary
+
+statement error 42702
+SELECT id FROM emp a, emp b
+
+statement error 42P01
+SELECT nope.id FROM emp
+
+statement error 2201W
+SELECT id FROM emp LIMIT -1
+
+statement error 21000
+SELECT (SELECT id FROM emp)

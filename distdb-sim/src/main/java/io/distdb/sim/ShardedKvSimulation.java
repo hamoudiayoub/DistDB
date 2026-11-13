@@ -192,6 +192,10 @@ public final class ShardedKvSimulation {
   private final Map<NodeId, String> pdPeers = new LinkedHashMap<>();
   private final List<SimClient> clients = new ArrayList<>();
   private final List<String> keys = new ArrayList<>();
+
+  /** Where forced splits cut, when set (the SQL simulation's row keys); else the keys. */
+  private List<byte[]> splitPoints = List.of();
+
   private final List<Linearizability.Op> history = new ArrayList<>();
   private final Map<KvStateMachine.RequestKey, String> effectAt = new HashMap<>();
   private final Set<KvStateMachine.RequestKey> acknowledged = new HashSet<>();
@@ -315,6 +319,22 @@ public final class ShardedKvSimulation {
           new TxnClient.Options(Duration.ofSeconds(1), Duration.ofSeconds(5), crash));
     }
 
+    /** A raw KV client, for tests that send Percolator commands themselves. */
+    public KvClient kvClient() {
+      NodeId id = new NodeId(150 + clients++);
+      sim.net.endpoint(id);
+      PdClient pd =
+          new PdClient(
+              List.copyOf(sim.pdPeers.values()), a -> sim.new SimChannel(id, sim.server(a)));
+      return new KvClient(
+          pd,
+          a -> sim.new SimChannel(id, sim.server(a)),
+          sim.clock,
+          sim.scheduler,
+          sim.random.split(),
+          ClientOptions.defaults());
+    }
+
     /** Runs the simulation until {@code f} completes (at most a minute), and returns its value. */
     public <T> T await(CompletableFuture<T> f) {
       for (int i = 0; i < 6000 && !f.isDone(); i++) {
@@ -332,6 +352,199 @@ public final class ShardedKvSimulation {
 
     public void run(Duration d) {
       sim.scheduler.runFor(d);
+    }
+
+    /** Simulated time since the start. */
+    public Duration elapsed() {
+      return Duration.ofNanos(sim.clock.nanoTime());
+    }
+
+    /** The placement driver's directory, for tests that look at placement. */
+    public String ranges() {
+      PdNode p = sim.pdLeader();
+      if (p == null) {
+        return "no PD leader";
+      }
+      StringBuilder b = new StringBuilder();
+      for (RangeInfo r : p.pd.ranges()) {
+        RangeDescriptor d = r.getDesc();
+        b.append(" r")
+            .append(d.getRangeId())
+            .append(" v")
+            .append(d.getVersion())
+            .append(" from ")
+            .append(
+                io.distdb.common.encoding.KeyReader.toDebugString(d.getStartKey().toByteArray()))
+            .append(" leader ")
+            .append(r.getLeader())
+            .append(" voters ")
+            .append(d.getVotersList())
+            .append(";");
+      }
+      return b.toString();
+    }
+  }
+
+  /**
+   * The faulty cluster of a seed, for a caller that drives its own clients step by step (the SQL
+   * simulation): partitions, power cuts of data nodes and of the PD leader, disk failures, stalls,
+   * forced splits and moves, and GC, all running while the caller waits on its futures. Then {@link
+   * #heal()} and {@link #finish()}, which checks that replicas converged.
+   */
+  public static final class Chaos {
+    private final ShardedKvSimulation sim;
+    private int clients;
+
+    private Chaos(long seed, Options options) {
+      sim = new ShardedKvSimulation(seed, options);
+      sim.faulty = false; // until faults(true)
+      sim.pds.values().forEach(PdNode::boot);
+      sim.data.values().forEach(DataNode::boot);
+      sim.every(
+          options.maxFaultInterval().dividedBy(6), options.maxFaultInterval(), sim::injectFault);
+      if (options.forcedOps()) {
+        sim.every(Duration.ofMillis(300), Duration.ofMillis(1500), sim::forceSplit);
+        sim.every(Duration.ofMillis(300), Duration.ofMillis(1500), sim::forceMove);
+      }
+      sim.every(Duration.ofMillis(100), Duration.ofMillis(100), sim::checkDisjoint);
+    }
+
+    /** {@code options.clients()} must be 0: the caller brings its own. */
+    public static Chaos start(long seed, Options options) {
+      if (options.clients() != 0) {
+        throw new IllegalArgumentException("the caller drives the clients");
+      }
+      return new Chaos(seed, options);
+    }
+
+    /** A transaction client on its own endpoint (partitioned like any node). */
+    public TxnClient txnClient() {
+      NodeId id = new NodeId(150 + clients++);
+      sim.net.endpoint(id);
+      PdClient pd =
+          new PdClient(
+              List.copyOf(sim.pdPeers.values()), a -> sim.new SimChannel(id, sim.server(a)));
+      KvClient kv =
+          new KvClient(
+              pd,
+              a -> sim.new SimChannel(id, sim.server(a)),
+              sim.clock,
+              sim.scheduler,
+              sim.random.split(),
+              ClientOptions.defaults());
+      return new TxnClient(
+          kv,
+          pd,
+          sim.clock,
+          sim.scheduler,
+          sim.random.split(),
+          new TxnClient.Options(
+              Duration.ofSeconds(1), Duration.ofSeconds(5), t -> TxnClient.CrashPoint.NONE));
+    }
+
+    /** Runs the world until {@code f} completes (at most ten simulated minutes). */
+    public <T> T await(CompletableFuture<T> f) {
+      for (int i = 0; i < 60_000 && !f.isDone(); i++) {
+        sim.scheduler.runFor(Duration.ofMillis(10));
+      }
+      if (!f.isDone()) {
+        throw new AssertionError("not done after ten simulated minutes");
+      }
+      try {
+        return f.join();
+      } catch (CompletionException e) {
+        throw e.getCause() instanceof RuntimeException r ? r : e;
+      }
+    }
+
+    public void run(Duration d) {
+      sim.scheduler.runFor(d);
+    }
+
+    /**
+     * Runs {@code task} on the simulation's thread after {@code delay}. A task may wait on futures
+     * with {@link #await}: waiting runs the world (other tasks included) until they complete.
+     */
+    public void schedule(Duration delay, Runnable task) {
+      sim.scheduler.schedule(delay, task);
+    }
+
+    /** Draws from the seed's randomness, for the caller's choices. */
+    public RandomSource random() {
+      return sim.random.split();
+    }
+
+    /** Simulated time since the start. */
+    public Duration elapsed() {
+      return Duration.ofNanos(sim.clock.nanoTime());
+    }
+
+    /** Forced splits cut at these keys from now on. */
+    public void splitPoints(List<byte[]> points) {
+      sim.splitPoints = List.copyOf(points);
+    }
+
+    /** Starts (or pauses) the partitions, power cuts, disk failures and stalls. */
+    public void faults(boolean on) {
+      sim.faulty = on;
+    }
+
+    /** Stops the faults, heals the network and restarts every node that is down. */
+    public void heal() {
+      sim.faulty = false;
+      sim.net.heal();
+      for (Node n : sim.allNodes()) {
+        n.life().stall(1);
+        if (n.isUp() && n.armed()) {
+          n.crash();
+        }
+        if (!n.isUp()) {
+          n.boot();
+        }
+      }
+      sim.quietStart = sim.clock.nanoTime();
+      sim.scheduler.runFor(Duration.ofSeconds(3));
+    }
+
+    /**
+     * Freezes placement and GC, lets every replica catch up, and checks: no overlapping replicas,
+     * the same entry applied at each index everywhere, and identical replicas tiling the key space.
+     */
+    public Report finish() {
+      sim.finished = true;
+      sim.pds.values().forEach(p -> p.pd.setScheduling(false));
+      sim.pds.values().stream().filter(p -> p.gc != null).forEach(p -> p.gc.stop());
+      sim.scheduler.runFor(Duration.ofSeconds(5));
+      if (sim.violation != null) {
+        throw new AssertionError("a check failed during the run", sim.violation);
+      }
+      sim.checkDisjoint();
+      int ranges = sim.checkRanges();
+      for (PdNode p : sim.pds.values()) {
+        if (p.gc != null) {
+          sim.gcRounds += p.gc.rounds();
+        }
+      }
+      return new Report(
+          sim.seed,
+          0,
+          0,
+          0,
+          0,
+          ranges,
+          sim.created.size(),
+          sim.configChanges.size(),
+          sim.destroyed,
+          sim.powerCuts,
+          sim.pdLeaderCrashes,
+          sim.diskFailures,
+          sim.partitions,
+          0,
+          0,
+          0,
+          0,
+          0,
+          sim.gcRounds);
     }
   }
 
@@ -527,10 +740,12 @@ public final class ShardedKvSimulation {
       return;
     }
     RangeDescriptor d = ranges.get(random.nextInt(ranges.size())).getDesc();
-    List<String> inside = keys.stream().filter(k -> Ranges.contains(d, utf8(k))).toList();
+    List<byte[]> points =
+        splitPoints.isEmpty() ? keys.stream().map(ShardedKvSimulation::utf8).toList() : splitPoints;
+    List<byte[]> inside = points.stream().filter(k -> Ranges.contains(d, k)).toList();
     if (inside.size() > 1) {
-      String key = inside.get(random.nextInt(1, inside.size()));
-      p.pd.requestSplit(d.getRangeId(), utf8(key));
+      byte[] key = inside.get(random.nextInt(1, inside.size()));
+      p.pd.requestSplit(d.getRangeId(), key);
     }
   }
 

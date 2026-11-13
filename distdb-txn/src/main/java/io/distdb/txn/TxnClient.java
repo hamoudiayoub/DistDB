@@ -105,6 +105,16 @@ public final class TxnClient {
   }
 
   /**
+   * Ends every transaction that started below {@code ts}: afterwards none of them can commit, and
+   * every one that had locked keys has finished (committed, or rolled back). Raises every range's
+   * floor to {@code ts}, then resolves every lock below it; see {@link Fence}. Transactions caught
+   * running fail with {@code TOO_OLD} and can be retried.
+   */
+  public CompletableFuture<Void> fence(long ts) {
+    return Fence.run(this, ts);
+  }
+
+  /**
    * Runs {@code body} in a transaction and commits it, starting again (after a backoff) when it
    * fails in a way a retry may fix: a conflict, an abort, or a too-old start. At most {@code
    * attempts} times. The body must not have effects outside the transaction.
