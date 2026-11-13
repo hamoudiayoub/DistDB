@@ -11,6 +11,7 @@ import io.distdb.rpc.proto.ExpireSessions;
 import io.distdb.rpc.proto.KvRequest;
 import io.distdb.rpc.proto.KvResponse;
 import io.distdb.rpc.proto.RangeDescriptor;
+import io.distdb.rpc.proto.TxnCommand;
 import io.distdb.rpc.proto.WriteCommand;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
@@ -37,6 +38,8 @@ final class Replica {
   private final Map<KvStateMachine.RequestKey, List<CompletableFuture<KvResponse>>> writes =
       new HashMap<>();
   private final Map<String, PendingRead> reads = new LinkedHashMap<>();
+  // Transactional commands carry no request id; the proposer tags each with a random id.
+  private final Map<Long, CompletableFuture<KvResponse>> commands = new HashMap<>();
   private long readSeq;
   private boolean wasLeader;
 
@@ -46,6 +49,15 @@ final class Replica {
    * {@code REMOVED} notice; safety comes from the replica's own log.
    */
   long heardConfig;
+
+  /** The newest GC safe point this replica has proposed, so it proposes each only once. */
+  long gcProposed;
+
+  /**
+   * Ticks since a leader last sent to this replica. After a while it probes the range's members: an
+   * orphaned learner never campaigns and keeps believing in its old leader, so only this tells.
+   */
+  int leaderlessTicks;
 
   /**
    * How long the log of this node's destroyed replica of this range was (from its tombstone), or 0.
@@ -155,6 +167,43 @@ final class Replica {
     }
   }
 
+  /**
+   * Proposes a transactional command. It is decided when applied, so the answer comes from the
+   * apply, matched by a random proposal id (random, so that ids from different leaders never meet).
+   */
+  void proposeTxn(KvRequest request, long deadline, CompletableFuture<KvResponse> result) {
+    long id;
+    do {
+      id = store.random().nextLong();
+    } while (id == 0 || commands.containsKey(id));
+    Command command =
+        Command.newBuilder()
+            .setTxn(
+                TxnCommand.newBuilder()
+                    .setRequest(request)
+                    .setProposalId(id)
+                    .setProposeTimeMillis(store.clock().wallTimeMillis()))
+            .build();
+    if (!raft.propose(command.toByteArray())) {
+      result.complete(store.notLeader(this, false));
+      return;
+    }
+    commands.put(id, result);
+    long proposal = id;
+    if (deadline != KvHandler.NO_DEADLINE) {
+      long grace = deadline - store.clock().nanoTime();
+      store
+          .scheduler()
+          .schedule(
+              Duration.ofNanos(Math.max(0, grace)).plusSeconds(1),
+              () ->
+                  store.submit(() -> {
+                    commands.remove(proposal);
+                    result.cancel(false);
+                  }));
+    }
+  }
+
   void startRead(KvRequest request, long deadline, CompletableFuture<KvResponse> result) {
     String context = "read-" + readSeq++;
     if (!raft.readIndex(context.getBytes(StandardCharsets.UTF_8))) {
@@ -180,6 +229,12 @@ final class Replica {
 
   /** The leader answers a write once it has applied it. */
   void applied(RangeStateMachine.Applied a) {
+    if (a.proposal() != 0) {
+      CompletableFuture<KvResponse> waiting = commands.remove(a.proposal());
+      if (waiting != null) {
+        waiting.complete(a.response());
+      }
+    }
     if (a.request() != null) {
       List<CompletableFuture<KvResponse>> waiting = writes.remove(a.request());
       if (waiting != null) {
@@ -213,6 +268,17 @@ final class Replica {
         p.future.complete(KvErrors.epochMismatch("the range split while the read waited"));
       } else if (p.request.hasGet()) {
         p.future.complete(KvReads.get(store.engine(), p.request.getGet()));
+      } else if (p.request.hasTxnGet()) {
+        p.future.complete(Percolator.get(store.engine(), p.request.getTxnGet(), machine.limits()));
+      } else if (p.request.hasTxnScan()) {
+        p.future.complete(
+            Percolator.scan(
+                store.engine(),
+                p.request.getTxnScan(),
+                machine.limits(),
+                store.config().kv().maxScanLimit()));
+      } else if (p.request.hasScanLocks()) {
+        p.future.complete(Percolator.scanLocks(store.engine(), p.request.getScanLocks(), d));
       } else {
         p.future.complete(
             KvReads.scan(
@@ -238,6 +304,8 @@ final class Replica {
   void failAll(KvResponse forWrites, KvResponse forReads) {
     writes.values().forEach(ws -> ws.forEach(w -> w.complete(forWrites)));
     writes.clear();
+    commands.values().forEach(c -> c.complete(forWrites));
+    commands.clear();
     reads.values().forEach(p -> p.future.complete(forReads));
     reads.clear();
   }

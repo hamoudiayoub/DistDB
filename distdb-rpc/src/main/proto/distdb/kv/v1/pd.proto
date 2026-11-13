@@ -30,6 +30,9 @@ message PdRequest {
     StoreHeartbeat heartbeat = 1;
     LocateRequest locate = 2;
     ListRangesRequest list_ranges = 3;
+    TsoRequest tso = 4;
+    SetGcSafePointRequest set_gc_safe_point = 5;
+    GetRangeRequest get_range = 6;
   }
 }
 
@@ -38,6 +41,9 @@ message PdResponse {
     StoreHeartbeatResponse heartbeat = 1;
     LocateResponse locate = 2;
     ListRangesResponse list_ranges = 3;
+    TsoResponse tso = 4;
+    SetGcSafePointResponse set_gc_safe_point = 5;
+    LocateResponse get_range = 6;
   }
 }
 
@@ -70,6 +76,8 @@ message StoreHeartbeatResponse {
   // What the PD wants done to ranges this store leads. Suggestions: the range's leader checks
   // each one and turns it into a Raft proposal, or ignores it.
   repeated Operator operators = 2;
+  // Ranges may drop versions below this; see 0008-transactions.md.
+  uint64 gc_safe_point = 3;
 }
 
 message Operator {
@@ -115,4 +123,32 @@ message ListRangesRequest {}
 message ListRangesResponse {
   repeated RangeInfo ranges = 1;
   map<uint32, string> stores = 2;
+}
+
+// count timestamps, strictly increasing and above any issued before this request arrived.
+message TsoRequest {
+  uint32 count = 1;
+}
+
+// The timestamps are first, first + 1, ..., first + count - 1.
+message TsoResponse {
+  uint64 first = 1;
+  uint32 count = 2;
+}
+
+// Raise the GC safe point (it never goes down). The GC worker calls it once every range has
+// refused new locks below it and has no old locks left.
+message SetGcSafePointRequest {
+  uint64 safe_point = 1;
+}
+
+message SetGcSafePointResponse {
+  uint64 safe_point = 1;
+}
+
+// The range with this id as the PD last heard it (answered like a Locate). A store asks for it
+// about a replica that has heard from no leader for a while, to probe the range's members: if
+// they no longer count this node, they say so, and the replica is destroyed.
+message GetRangeRequest {
+  uint64 range_id = 1;
 }

@@ -187,6 +187,16 @@ span. The rules:
   acknowledged, because it caught up from a leader, and leaders hold every committed entry.
   CockroachDB reaches the same end differently: a replica added back gets a new replica id, so
   old configurations do not count it at all.
+- **Stamps describe the configuration that made the message** (found in Phase 7). Each message
+  carries the sender's configuration index, so a replica being added back can tell it from a
+  stale one; but only if that configuration counts the receiver. A heartbeat queued just before
+  the change that removed its receiver, and sent just after, would otherwise carry the new index,
+  and the removed replica would take its own removal as proof that it is a member.
+- **Orphans nobody answers get a probe** (also Phase 7). If the old configuration's members no
+  longer host the range at all, an orphan's campaign reaches nobody who could say `Removed`. A
+  replica that no leader has sent to for 3 seconds asks the PD who the members are now, and
+  probes them; they answer under the same rule. ("No leader has sent to it", not "it knows no
+  leader": an orphaned learner never campaigns and believes in its old leader forever.)
 - **Destroy keeps the hard state.** Data, sessions, log and descriptor go; the term and vote stay,
   plus a tombstone with `conf_ver`. If the node is added back later, it can't vote twice in a term
   it already voted in. Messages from configurations at or below the tombstone are dropped; newer
@@ -329,6 +339,8 @@ across every range. Across runs on this machine, once the cluster had formed:
 | S8: destroying a replica also forgets its term and vote | survived | `aMovedReplicaIsDestroyedByARemovedNoticeAndCanBeAddedBack` |
 | S9: a split creates the new range on a node that is not a member | survived | `aReplicaThatIsNoLongerAMemberDoesNotCreateTheNewRange` |
 | S10: a replica added back votes before it has caught up | seed 231, the only failure in 300 seeds: two different entries committed at one index | |
+| S11: a message carries the sender's configuration index whether or not it counts the receiver | bank seed 33: a learner never initialized, blocked by an orphan that ignored its notices (found as a real bug in Phase 7) | |
+| S12: only replicas that know no leader probe the range's members | bank seed 823 of 2,000: a learner blocked by an orphaned learner (found as a real bug in Phase 7) | |
 
 What the survivors say:
 

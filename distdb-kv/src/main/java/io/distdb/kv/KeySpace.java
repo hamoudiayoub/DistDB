@@ -45,6 +45,9 @@ public final class KeySpace {
    */
   static final byte TOMBSTONE = 'T';
 
+  /** {@code 'g' range}: the range's transaction floor and GC safe point (replicated). */
+  static final byte TXN_LIMITS = 'g';
+
   /**
    * The ranges of the replicated state machine: client data, plus client sessions and their results
    * ({@code 'r'} and {@code 's'} are adjacent). Everything else in the local space (Raft logs, the

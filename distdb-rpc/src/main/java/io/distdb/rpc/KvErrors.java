@@ -4,12 +4,18 @@ import io.distdb.rpc.proto.DeadlineExceeded;
 import io.distdb.rpc.proto.EpochMismatch;
 import io.distdb.rpc.proto.Error;
 import io.distdb.rpc.proto.InvalidArgument;
+import io.distdb.rpc.proto.KeyLocked;
 import io.distdb.rpc.proto.KvResponse;
+import io.distdb.rpc.proto.LockInfo;
 import io.distdb.rpc.proto.NotLeader;
 import io.distdb.rpc.proto.RangeNotFound;
 import io.distdb.rpc.proto.ServerBusy;
 import io.distdb.rpc.proto.StaleRequest;
 import io.distdb.rpc.proto.StorageFailure;
+import io.distdb.rpc.proto.TxnAborted;
+import io.distdb.rpc.proto.TxnCommitted;
+import io.distdb.rpc.proto.TxnTooOld;
+import io.distdb.rpc.proto.WriteConflict;
 
 /** Builds responses that carry a typed {@link Error}. */
 public final class KvErrors {
@@ -62,6 +68,31 @@ public final class KvErrors {
 
   public static KvResponse epochMismatch(String message) {
     return of(Error.newBuilder().setEpochMismatch(EpochMismatch.getDefaultInstance()), message);
+  }
+
+  public static KvResponse keyLocked(LockInfo lock, String message) {
+    return of(Error.newBuilder().setKeyLocked(KeyLocked.newBuilder().setLock(lock)), message);
+  }
+
+  public static KvResponse writeConflict(long commitTs, String message) {
+    return of(
+        Error.newBuilder()
+            .setWriteConflict(WriteConflict.newBuilder().setConflictCommitTs(commitTs)),
+        message);
+  }
+
+  public static KvResponse txnAborted(String message) {
+    return of(Error.newBuilder().setTxnAborted(TxnAborted.getDefaultInstance()), message);
+  }
+
+  public static KvResponse txnCommitted(long commitTs, String message) {
+    return of(
+        Error.newBuilder().setTxnCommitted(TxnCommitted.newBuilder().setCommitTs(commitTs)),
+        message);
+  }
+
+  public static KvResponse txnTooOld(long floor, String message) {
+    return of(Error.newBuilder().setTxnTooOld(TxnTooOld.newBuilder().setFloor(floor)), message);
   }
 
   public static KvResponse staleRequest(String message) {

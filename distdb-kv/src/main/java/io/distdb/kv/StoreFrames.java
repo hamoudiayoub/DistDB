@@ -31,6 +31,13 @@ final class StoreFrames {
   static final byte REMOVED = 1;
 
   /**
+   * "Do you count me as a member?" from a replica that has heard from no leader for a while, to the
+   * range's members as the placement driver knows them. A member that does not count the sender
+   * answers {@link #REMOVED}; otherwise it says nothing.
+   */
+  static final byte PROBE = 2;
+
+  /**
    * One item.
    *
    * @param configIndex for {@link #RAFT}: the sender's latest configuration index, so a receiver

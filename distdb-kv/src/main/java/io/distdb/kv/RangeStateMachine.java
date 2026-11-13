@@ -8,9 +8,12 @@ import io.distdb.raft.HardState;
 import io.distdb.raft.Membership;
 import io.distdb.raft.RaftCodec;
 import io.distdb.raft.Snapshot;
+import io.distdb.rpc.KvErrors;
 import io.distdb.rpc.proto.Command;
+import io.distdb.rpc.proto.KvRequest;
 import io.distdb.rpc.proto.KvResponse;
 import io.distdb.rpc.proto.RangeDescriptor;
+import io.distdb.rpc.proto.SetTxnFloorResponse;
 import io.distdb.rpc.proto.SplitCommand;
 import io.distdb.storage.KvEngine;
 import io.distdb.storage.KvEntry;
@@ -23,6 +26,8 @@ import java.io.DataOutputStream;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 
@@ -68,6 +73,8 @@ public final class RangeStateMachine {
    * @param created the range a split created here, or null (no split, or this node was already
    *     removed from the new range)
    * @param membershipChanged whether it was a membership change
+   * @param proposal for a transactional command, the id its proposer gave it (0 otherwise); the
+   *     response is then that command's
    */
   public record Applied(
       long index,
@@ -75,7 +82,8 @@ public final class RangeStateMachine {
       KvResponse response,
       boolean effect,
       RangeDescriptor created,
-      boolean membershipChanged) {}
+      boolean membershipChanged,
+      long proposal) {}
 
   private final KvEngine engine;
   private final NodeId self;
@@ -84,6 +92,7 @@ public final class RangeStateMachine {
   private final ClientSessions sessions;
   private RangeDescriptor descriptor; // null while uninitialized
   private long applied;
+  private Percolator.Limits limits;
 
   RangeStateMachine(KvEngine engine, NodeId self, long rangeId, KvServiceOptions options) {
     this.engine = Objects.requireNonNull(engine);
@@ -93,6 +102,61 @@ public final class RangeStateMachine {
     this.sessions = new ClientSessions(engine, KeySpace.uint64(rangeId));
     this.descriptor = engine.get(descriptorKey(rangeId)).map(RangeStateMachine::parse).orElse(null);
     this.applied = engine.get(appliedKey(rangeId)).map(v -> KeySpace.readUint64(v, 0)).orElse(0L);
+    this.limits = readLimits(engine, rangeId);
+  }
+
+  /** The range's transaction floor and GC safe point. */
+  Percolator.Limits limits() {
+    return limits;
+  }
+
+  /** A transactional command, decided now: its effect goes into {@code batch}. */
+  private KvResponse applyTxn(WriteBatch batch, KvRequest r) {
+    if (!Store.inSpan(r, descriptor)) {
+      return KvErrors.epochMismatch("the key moved to another range before this command");
+    }
+    return switch (r.getOpCase()) {
+      case PREWRITE -> Percolator.prewrite(batch, engine, r.getPrewrite(), limits);
+      case TXN_COMMIT -> Percolator.commit(batch, engine, r.getTxnCommit());
+      case TXN_ROLLBACK -> Percolator.rollback(batch, engine, r.getTxnRollback());
+      case CHECK_TXN_STATUS ->
+          Percolator.checkTxnStatus(batch, engine, r.getCheckTxnStatus(), limits);
+      case SET_TXN_FLOOR -> {
+        long floor = Math.max(limits.floor(), r.getSetTxnFloor().getFloor());
+        setLimits(batch, new Percolator.Limits(floor, limits.safePoint()));
+        SetTxnFloorResponse.Builder out = SetTxnFloorResponse.newBuilder().setFloor(floor);
+        if (descriptor.hasEndKey()) {
+          out.setRangeEnd(descriptor.getEndKey());
+        }
+        yield KvResponse.newBuilder().setSetTxnFloor(out).build();
+      }
+      default -> KvErrors.invalidArgument("not a transactional command: " + r.getOpCase());
+    };
+  }
+
+  private void setLimits(WriteBatch batch, Percolator.Limits l) {
+    batch.put(limitsKey(rangeId), limitsValue(l));
+    pendingLimits = l;
+  }
+
+  private Percolator.Limits pendingLimits;
+
+  private static Percolator.Limits readLimits(KvEngine engine, long rangeId) {
+    return engine
+        .get(limitsKey(rangeId))
+        .map(v -> new Percolator.Limits(KeySpace.readUint64(v, 0), KeySpace.readUint64(v, 8)))
+        .orElse(Percolator.Limits.NONE);
+  }
+
+  private static byte[] limitsValue(Percolator.Limits l) {
+    byte[] v = new byte[16];
+    System.arraycopy(KeySpace.uint64(l.floor()), 0, v, 0, 8);
+    System.arraycopy(KeySpace.uint64(l.safePoint()), 0, v, 8, 8);
+    return v;
+  }
+
+  static byte[] limitsKey(long rangeId) {
+    return KeySpace.local(KeySpace.TXN_LIMITS, KeySpace.uint64(rangeId));
   }
 
   /** The range as of the last entry applied, or null if this replica is uninitialized. */
@@ -118,12 +182,12 @@ public final class RangeStateMachine {
     }
     WriteBatch batch = new WriteBatch();
     RangeDescriptor next = descriptor;
-    Applied result = new Applied(e.index(), null, null, false, null, false);
+    Applied result = new Applied(e.index(), null, null, false, null, false, 0);
     if (e.type() == Entry.Type.CONFIG) {
       Membership m = RaftCodec.decodeMembership(e.data());
       next = Ranges.withMembership(descriptor, m, e.index());
       batch.put(descriptorKey(rangeId), next.toByteArray());
-      result = new Applied(e.index(), null, null, false, null, true);
+      result = new Applied(e.index(), null, null, false, null, true, 0);
     } else if (e.data().length > 0) {
       Command c = parseCommand(e.data());
       switch (c.getKindCase()) {
@@ -132,7 +196,7 @@ public final class RangeStateMachine {
           KvWrites.Result w =
               KvWrites.apply(
                   batch, engine, sessions, c.getWrite(), options, k -> Ranges.contains(owner, k));
-          result = new Applied(e.index(), w.request(), w.response(), w.effect(), null, false);
+          result = new Applied(e.index(), w.request(), w.response(), w.effect(), null, false, 0);
         }
         case EXPIRE_SESSIONS ->
             sessions.expire(
@@ -143,7 +207,20 @@ public final class RangeStateMachine {
           RangeDescriptor[] out = split(batch, c.getSplit());
           if (out != null) {
             next = out[0];
-            result = new Applied(e.index(), null, null, false, out[1], false);
+            result = new Applied(e.index(), null, null, false, out[1], false, 0);
+          }
+        }
+        case TXN -> {
+          KvResponse response = applyTxn(batch, c.getTxn().getRequest());
+          result =
+              new Applied(
+                  e.index(), null, response, false, null, false, c.getTxn().getProposalId());
+        }
+        case GC -> {
+          long g = c.getGc().getSafePoint();
+          if (g > limits.safePoint()) {
+            Percolator.gc(batch, engine, descriptor, g);
+            setLimits(batch, new Percolator.Limits(Math.max(limits.floor(), g), g));
           }
         }
         case KIND_NOT_SET -> throw new IllegalStateException("empty command at " + e.index());
@@ -153,6 +230,10 @@ public final class RangeStateMachine {
     engine.write(batch, false); // the log is durable; a lost apply is replayed from it
     descriptor = next;
     applied = e.index();
+    if (pendingLimits != null) {
+      limits = pendingLimits;
+      pendingLimits = null;
+    }
     return result;
   }
 
@@ -198,6 +279,8 @@ public final class RangeStateMachine {
     sessions.copyTo(batch, rightSessions);
     batch.put(descriptorKey(newId), right.toByteArray());
     batch.put(appliedKey(newId), KeySpace.uint64(INITIAL_INDEX));
+    byte[] rightLimits = limitsValue(limits); // the new range inherits the floor and safe point
+    batch.put(limitsKey(newId), rightLimits);
     RaftStore rightStore = new RaftStore(engine, newId);
     // A replica of the new range may already exist here, uninitialized, and may have voted in
     // its first election: keep that term and vote, or this node could vote twice in a term.
@@ -212,6 +295,7 @@ public final class RangeStateMachine {
             right,
             sink -> {
               sessions.forEach(KeySpace.uint64(newId), sink::write);
+              sink.write(limitsKey(newId), rightLimits);
               scanSpan(right, sink::write);
             });
     rightStore.initialize(
@@ -230,6 +314,7 @@ public final class RangeStateMachine {
         d,
         sink -> {
           sessions.forEach(KeySpace.uint64(rangeId), sink::write);
+          sink.write(limitsKey(rangeId), limitsValue(limits));
           scanSpan(d, sink::write);
         });
   }
@@ -253,6 +338,7 @@ public final class RangeStateMachine {
     engine.write(batch, false); // the snapshot itself is stored durably by RaftStore
     descriptor = d;
     applied = s.index();
+    limits = readLimits(engine, rangeId);
   }
 
   /**
@@ -266,6 +352,7 @@ public final class RangeStateMachine {
     sessions.deleteAll(batch);
     batch.delete(descriptorKey(rangeId));
     batch.delete(appliedKey(rangeId));
+    batch.delete(limitsKey(rangeId));
   }
 
   /** Writes a brand-new range {@code d} into {@code batch}: the first range of a new cluster. */
@@ -355,12 +442,18 @@ public final class RangeStateMachine {
     }
   }
 
+  /**
+   * Every engine entry of {@code d}'s span: plain client data and the three transactional columns.
+   */
   private void scanSpan(RangeDescriptor d, Sink sink) {
-    byte[][] span = Ranges.userSpan(d);
-    try (KvIterator it = engine.scan(span[0], span[1])) {
-      while (it.hasNext()) {
-        KvEntry e = it.next();
-        sink.write(e.key(), e.value());
+    List<byte[][]> spans = new ArrayList<>(Percolator.spans(d));
+    spans.addFirst(Ranges.userSpan(d));
+    for (byte[][] span : spans) {
+      try (KvIterator it = engine.scan(span[0], span[1])) {
+        while (it.hasNext()) {
+          KvEntry e = it.next();
+          sink.write(e.key(), e.value());
+        }
       }
     }
   }

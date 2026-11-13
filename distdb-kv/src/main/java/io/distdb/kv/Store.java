@@ -19,6 +19,8 @@ import io.distdb.rpc.KvErrors;
 import io.distdb.rpc.KvHandler;
 import io.distdb.rpc.PdClient;
 import io.distdb.rpc.proto.Command;
+import io.distdb.rpc.proto.GcCommand;
+import io.distdb.rpc.proto.GetRangeRequest;
 import io.distdb.rpc.proto.KvRequest;
 import io.distdb.rpc.proto.KvResponse;
 import io.distdb.rpc.proto.Operator;
@@ -80,6 +82,7 @@ public final class Store implements KvHandler, AutoCloseable {
 
   private static final System.Logger LOG = System.getLogger(Store.class.getName());
   private static final Comparator<NodeId> BY_VALUE = Comparator.comparingInt(NodeId::value);
+  private static final Duration ORPHAN_PROBE_AFTER = Duration.ofSeconds(3);
 
   /**
    * How a store is set up.
@@ -166,6 +169,7 @@ public final class Store implements KvHandler, AutoCloseable {
   private final Map<NodeId, List<StoreFrames.Item>> outbox = new TreeMap<>(BY_VALUE);
   private final Map<NodeId, String> addresses = new ConcurrentHashMap<>(); // read by the transport
   private boolean reportScheduled;
+  private long gcSafePoint; // the newest GC safe point the placement driver has announced
   private volatile boolean stopped;
   private volatile Throwable failure;
 
@@ -264,10 +268,13 @@ public final class Store implements KvHandler, AutoCloseable {
       return;
     }
     boolean write = KvRequests.isWrite(request);
+    boolean txn = KvRequests.isTxnCommand(request);
     try {
       if (write) {
         KvRequests.validateWrite(request, config.kv());
-      } else if (request.hasGet() || request.hasScan()) {
+      } else if (txn) {
+        KvRequests.validateTxn(request, config.kv());
+      } else if (KvRequests.isRead(request)) {
         KvRequests.validateRead(request, config.kv());
       } else {
         result.complete(KvErrors.invalidArgument("request has no operation"));
@@ -329,6 +336,8 @@ public final class Store implements KvHandler, AutoCloseable {
     }
     if (write) {
       r.propose(request, deadline, result);
+    } else if (txn) {
+      r.proposeTxn(request, deadline, result);
     } else {
       r.startRead(request, deadline, result);
     }
@@ -342,15 +351,16 @@ public final class Store implements KvHandler, AutoCloseable {
       return Ranges.containsSpan(
           d, s.getStartKey().toByteArray(), s.hasEndKey() ? s.getEndKey().toByteArray() : null);
     }
+    if (request.hasTxnScan()) {
+      var s = request.getTxnScan();
+      return Ranges.containsSpan(
+          d, s.getStartKey().toByteArray(), s.hasEndKey() ? s.getEndKey().toByteArray() : null);
+    }
     return Ranges.contains(d, routingKey(request));
   }
 
   private static byte[] routingKey(KvRequest request) {
-    return switch (request.getOpCase()) {
-      case GET -> request.getGet().getKey().toByteArray();
-      case SCAN -> request.getScan().getStartKey().toByteArray();
-      default -> KvRequests.writeKey(request);
-    };
+    return KvRequests.routingKey(request);
   }
 
   private Replica replicaHolding(byte[] key) {
@@ -396,6 +406,16 @@ public final class Store implements KvHandler, AutoCloseable {
       return;
     }
     for (StoreFrames.Item item : StoreFrames.decode(frame)) {
+      if (item.kind() == StoreFrames.PROBE) {
+        Replica r = replicas.get(item.rangeId());
+        if (r != null && r.initialized() && !r.isMember(from)) {
+          send(
+              from,
+              new StoreFrames.Item(
+                  r.id, StoreFrames.REMOVED, r.descriptor().getConfVer(), new byte[0]));
+        }
+        continue;
+      }
       if (item.kind() == StoreFrames.REMOVED) {
         Replica r = replicas.get(item.rangeId());
         // Destroy only if our own log holds no configuration as new as the one that removed us:
@@ -437,6 +457,11 @@ public final class Store implements KvHandler, AutoCloseable {
       if (fromLeaderOrCandidate) {
         r.heardConfig = Math.max(r.heardConfig, item.configIndex());
       }
+      if (m instanceof Message.AppendEntries
+          || m instanceof Message.Heartbeat
+          || m instanceof Message.InstallSnapshot) {
+        r.leaderlessTicks = 0; // a leader still counts it
+      }
       if (r.recovering() && (m instanceof Message.RequestVote || m instanceof Message.TimeoutNow)) {
         // It was destroyed and added back, and its log is shorter than before: it may have lost
         // entries it acknowledged, so its vote could help elect a leader without them.
@@ -473,6 +498,14 @@ public final class Store implements KvHandler, AutoCloseable {
       if (!r.recovering()) {
         r.raft.tick(); // a recovering replica must not campaign
       }
+      if (r.initialized() && !r.leading()) {
+        if (++r.leaderlessTicks * config.tick().toMillis() >= ORPHAN_PROBE_AFTER.toMillis()) {
+          r.leaderlessTicks = 0;
+          probe(r);
+        }
+      } else {
+        r.leaderlessTicks = 0;
+      }
       r.maybeSweepSessions(config.tick());
       markDirty(r);
     }
@@ -508,8 +541,12 @@ public final class Store implements KvHandler, AutoCloseable {
       r.raftStore.save(rd); // synced: nothing in this Ready may be seen before it is on disk
       long configIndex = r.raft.configIndex();
       for (Message m : rd.messages()) {
-        send(
-            m.to(), new StoreFrames.Item(r.id, StoreFrames.RAFT, configIndex, RaftCodec.encode(m)));
+        // The stamp tells the receiver "my latest configuration, at this index, counts you", so a
+        // replica being added back can tell this from a stale message. A message made before a
+        // change that removed its receiver is sent after it (same Ready): it must not carry the
+        // new index, or that receiver would take its own removal as proof it is a member.
+        long stamp = r.raft.membership().isMember(m.to()) ? configIndex : 0;
+        send(m.to(), new StoreFrames.Item(r.id, StoreFrames.RAFT, stamp, RaftCodec.encode(m)));
       }
       if (rd.snapshot() != null && rd.snapshotReplacesLog()) {
         r.machine.restore(rd.snapshot());
@@ -619,6 +656,49 @@ public final class Store implements KvHandler, AutoCloseable {
     scheduler.schedule(config.heartbeatInterval(), this::heartbeatTimer);
   }
 
+  /**
+   * Asks the placement driver who the members of {@code r}'s range are now, and asks each of them
+   * whether it still counts this node. A replica that hears from no leader may simply be
+   * partitioned; or it may be an orphan, removed without being told, whose old configuration's
+   * members no longer even host the range, so its own messages reach nobody who could answer {@code
+   * REMOVED}. The PD only says whom to ask; the members decide, under the usual rule.
+   */
+  private void probe(Replica r) {
+    if (pd == null) {
+      return;
+    }
+    long id = r.id;
+    pd.call(
+            PdRequest.newBuilder().setGetRange(GetRangeRequest.newBuilder().setRangeId(id)).build(),
+            config.heartbeatInterval())
+        .whenComplete((response, error) -> {
+          if (response == null || !response.getGetRange().getFound()) {
+            return;
+          }
+          submit(() -> {
+            Replica now = replicas.get(id);
+            if (now == null || stopped || failure != null) {
+              return;
+            }
+            response
+                .getGetRange()
+                .getAddressesMap()
+                .forEach((n, a) -> addresses.putIfAbsent(new NodeId(n), a));
+            RangeDescriptor d = response.getGetRange().getRange().getDesc();
+            List<Integer> members = new ArrayList<>(d.getVotersList());
+            members.addAll(d.getLearnersList());
+            for (int n : members) {
+              if (n != config.self().value()) {
+                send(
+                    new NodeId(n),
+                    new StoreFrames.Item(
+                        id, StoreFrames.PROBE, now.raft.configIndex(), new byte[0]));
+              }
+            }
+          });
+        });
+  }
+
   /** Reports to the placement driver soon, after a split or membership change. */
   private void reportSoon() {
     if (pd == null || reportScheduled) {
@@ -676,6 +756,22 @@ public final class Store implements KvHandler, AutoCloseable {
       return;
     }
     response.getStoresMap().forEach((id, address) -> addresses.put(new NodeId(id), address));
+    gcSafePoint = Math.max(gcSafePoint, response.getGcSafePoint());
+    for (Replica r : replicas.values()) {
+      // Every range drops what no transaction can read any more, through its own log.
+      if (r.initialized()
+          && r.leading()
+          && r.machine.limits().safePoint() < gcSafePoint
+          && r.gcProposed < gcSafePoint
+          && r.raft.propose(
+              Command.newBuilder()
+                  .setGc(GcCommand.newBuilder().setSafePoint(gcSafePoint))
+                  .build()
+                  .toByteArray())) {
+        r.gcProposed = gcSafePoint;
+        markDirty(r);
+      }
+    }
     for (Operator op : response.getOperatorsList()) {
       Replica r = replicas.get(op.getRangeId());
       if (r != null && r.initialized() && r.leading()) {
@@ -777,13 +873,17 @@ public final class Store implements KvHandler, AutoCloseable {
     }
   }
 
+  /** Plain keys plus transactional versions and locks in {@code d}'s span. */
   private long keyCount(RangeDescriptor d) {
-    byte[][] span = Ranges.userSpan(d);
+    List<byte[][]> spans = new ArrayList<>(Percolator.spans(d).subList(1, 3));
+    spans.add(Ranges.userSpan(d));
     long n = 0;
-    try (KvIterator it = engine.scan(span[0], span[1])) {
-      while (it.hasNext()) {
-        it.next();
-        n++;
+    for (byte[][] span : spans) {
+      try (KvIterator it = engine.scan(span[0], span[1])) {
+        while (it.hasNext()) {
+          it.next();
+          n++;
+        }
       }
     }
     return n;
@@ -791,14 +891,21 @@ public final class Store implements KvHandler, AutoCloseable {
 
   /** The middle key of {@code d}'s data, or null if it has fewer than two keys. */
   private byte[] middleKey(RangeDescriptor d) {
+    java.util.TreeSet<byte[]> keys = new java.util.TreeSet<>(Bytes.COMPARATOR);
     byte[][] span = Ranges.userSpan(d);
-    List<byte[]> keys = new ArrayList<>();
     try (KvIterator it = engine.scan(span[0], span[1])) {
       while (it.hasNext()) {
         keys.add(KeySpace.fromUser(it.next().key()));
       }
     }
-    return keys.size() < 2 ? null : keys.get(keys.size() / 2);
+    byte[][] writes = Percolator.spans(d).get(2);
+    try (KvIterator it = engine.scan(writes[0], writes[1])) {
+      while (it.hasNext()) {
+        keys.add(Percolator.userKeyOf(it.next().key()));
+      }
+    }
+    List<byte[]> sorted = new ArrayList<>(keys);
+    return sorted.size() < 2 ? null : sorted.get(sorted.size() / 2);
   }
 
   // -----------------------------------------------------------------------------------------------

@@ -18,10 +18,18 @@ final class KvRequests {
     }
   }
 
-  /** Validates a Get or Scan: keys within limits (scan bounds may be one byte longer). */
+  /** Validates a read: keys within limits (scan bounds may be one byte longer). */
   static void validateRead(KvRequest request, KvServiceOptions options) {
     switch (request.getOpCase()) {
       case GET -> key(request.getGet().getKey(), options.maxKeyBytes());
+      case TXN_GET -> key(request.getTxnGet().getKey(), options.maxKeyBytes());
+      case TXN_SCAN -> {
+        key(request.getTxnScan().getStartKey(), options.maxKeyBytes() + 1);
+        if (request.getTxnScan().hasEndKey()) {
+          key(request.getTxnScan().getEndKey(), options.maxKeyBytes() + 1);
+        }
+      }
+      case SCAN_LOCKS -> key(request.getScanLocks().getStartKey(), options.maxKeyBytes() + 1);
       case SCAN -> {
         key(request.getScan().getStartKey(), options.maxKeyBytes() + 1);
         if (request.getScan().hasEndKey()) {
@@ -72,6 +80,58 @@ final class KvRequests {
     }
   }
 
+  /** Reads, served after ReadIndex: Get, Scan and the transactional reads. */
+  static boolean isRead(KvRequest r) {
+    return switch (r.getOpCase()) {
+      case GET, SCAN, TXN_GET, TXN_SCAN, SCAN_LOCKS -> true;
+      default -> false;
+    };
+  }
+
+  /**
+   * Transactional commands: decided when applied, and idempotent, so they carry no request id;
+   * Percolator's own state recognizes a repeat.
+   */
+  static boolean isTxnCommand(KvRequest r) {
+    return switch (r.getOpCase()) {
+      case PREWRITE, TXN_COMMIT, TXN_ROLLBACK, CHECK_TXN_STATUS, SET_TXN_FLOOR -> true;
+      default -> false;
+    };
+  }
+
+  /** Validates a transactional command: keys and values within limits, timestamps set. */
+  static void validateTxn(KvRequest r, KvServiceOptions options) {
+    key(routingKey(r), options.maxKeyBytes());
+    if (r.hasPrewrite()) {
+      key(r.getPrewrite().getPrimary(), options.maxKeyBytes());
+      int size = r.getPrewrite().getMutation().getValue().size();
+      if (size > options.maxValueBytes()) {
+        throw new InvalidRequest(
+            "value is " + size + " bytes; the limit is " + options.maxValueBytes());
+      }
+      if (r.getPrewrite().getStartTs() <= 0) {
+        throw new InvalidRequest("a prewrite needs a start_ts");
+      }
+    }
+  }
+
+  /** The key that decides which range a request belongs to (a scan's start). */
+  static byte[] routingKey(KvRequest r) {
+    return switch (r.getOpCase()) {
+      case GET -> r.getGet().getKey().toByteArray();
+      case SCAN -> r.getScan().getStartKey().toByteArray();
+      case TXN_GET -> r.getTxnGet().getKey().toByteArray();
+      case TXN_SCAN -> r.getTxnScan().getStartKey().toByteArray();
+      case SCAN_LOCKS -> r.getScanLocks().getStartKey().toByteArray();
+      case PREWRITE -> r.getPrewrite().getMutation().getKey().toByteArray();
+      case TXN_COMMIT -> r.getTxnCommit().getKey().toByteArray();
+      case TXN_ROLLBACK -> r.getTxnRollback().getKey().toByteArray();
+      case CHECK_TXN_STATUS -> r.getCheckTxnStatus().getPrimary().toByteArray();
+      case SET_TXN_FLOOR -> r.getSetTxnFloor().getKey().toByteArray();
+      default -> writeKey(r);
+    };
+  }
+
   /** Whether {@code request} is a write (it then needs a request id). */
   static boolean isWrite(KvRequest request) {
     return request.hasPut() || request.hasDelete() || request.hasCput();
@@ -85,6 +145,13 @@ final class KvRequests {
       case CPUT -> request.getCput().getKey().toByteArray();
       default -> throw new IllegalArgumentException("not a write: " + request.getOpCase());
     };
+  }
+
+  static byte[] key(byte[] key, int maxBytes) {
+    if (key.length > maxBytes) {
+      throw new InvalidRequest("key is " + key.length + " bytes; the limit is " + maxBytes);
+    }
+    return key;
   }
 
   static byte[] key(ByteString key, int maxBytes) {

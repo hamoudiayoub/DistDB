@@ -1,5 +1,7 @@
 package io.distdb.server;
 
+import io.distdb.client.ClientOptions;
+import io.distdb.client.KvClient;
 import io.distdb.common.NodeId;
 import io.distdb.env.ExecutorScheduler;
 import io.distdb.env.LocalFileSystem;
@@ -19,6 +21,8 @@ import io.distdb.rpc.proto.PdRequest;
 import io.distdb.rpc.proto.RangeInfo;
 import io.distdb.storage.lsm.EngineOptions;
 import io.distdb.storage.lsm.LsmEngine;
+import io.distdb.txn.GcWorker;
+import io.distdb.txn.TxnClient;
 import java.io.IOException;
 import java.io.PrintStream;
 import java.net.InetSocketAddress;
@@ -122,7 +126,9 @@ final class ShardedCommands {
   /** {@code distdb pd --data-dir DIR --id N --peers 1=HOST:PORT,... [--split-keys N]} */
   static int pd(List<String> argv, PrintStream out, PrintStream err) throws Exception {
     Args args =
-        Args.parse(argv, java.util.Set.of("data-dir", "id", "peers", "split-keys", "dead-after"));
+        Args.parse(
+            argv,
+            java.util.Set.of("data-dir", "id", "peers", "split-keys", "dead-after", "gc-lifetime"));
     if (!args.positional().isEmpty()) {
       throw new Args.UsageException("unexpected argument " + args.positional().getFirst());
     }
@@ -136,6 +142,7 @@ final class ShardedCommands {
     PlacementDriver.Config defaults = PlacementDriver.Config.defaults(self, peers);
     long splitKeys = Long.parseLong(args.option("split-keys", "" + defaults.splitKeys()));
     Duration deadAfter = Args.duration(args.option("dead-after", "30s"));
+    Duration gcLifetime = Args.duration(args.option("gc-lifetime", "10m"));
     DataDirLock lock = DataDirLock.acquire(dataDir, err);
     if (lock == null) {
       return 3;
@@ -180,7 +187,35 @@ final class ShardedCommands {
             SystemClock.INSTANCE,
             transport.service());
     kv.start();
+    // The GC worker runs on whichever PD node leads, and reaches the ranges like any client.
+    PdClient selfPd = new PdClient(List.copyOf(peers.values()), GrpcKvChannel::connect);
+    KvClient gcClient =
+        new KvClient(
+            selfPd,
+            GrpcKvChannel::connect,
+            SystemClock.INSTANCE,
+            scheduler,
+            SplittableRandomSource.fromEntropy(),
+            ClientOptions.defaults());
+    GcWorker gc =
+        new GcWorker(
+            new TxnClient(
+                gcClient,
+                selfPd,
+                SystemClock.INSTANCE,
+                scheduler,
+                SplittableRandomSource.fromEntropy(),
+                TxnClient.Options.defaults()),
+            selfPd,
+            scheduler,
+            gcLifetime,
+            Duration.ofSeconds(30),
+            driver::isLeader);
+    gc.start();
     onShutdown(() -> {
+      gc.stop();
+      gcClient.close();
+      selfPd.close();
       server.close();
       driver.close();
       kv.close();

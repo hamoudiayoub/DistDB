@@ -68,6 +68,11 @@ public final class Ranges {
     };
   }
 
+  /** The engine spans of {@code d}'s transactional columns: data, locks, write records. */
+  public static List<byte[][]> transactionalSpans(RangeDescriptor d) {
+    return Percolator.spans(d);
+  }
+
   /** For logs and failure messages: {@code r7[k10, k20) v3 c12 voters [1, 2, 3]}. */
   public static String describe(RangeDescriptor d) {
     return "r"

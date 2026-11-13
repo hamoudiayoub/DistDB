@@ -1,0 +1,168 @@
+// Transactions with snapshot isolation, after Google's Percolator. See
+// docs/design/0008-transactions.md.
+//
+// Every key has three column families inside its range: data (key@start_ts -> value), lock
+// (key -> LockInfo) and write (key@commit_ts -> WriteRecord). Each command below acts on one key
+// (or, for SetTxnFloor and ScanLocks, on the range holding it), goes through the range's Raft log,
+// and is idempotent: a repeat is recognized from that state, so no request id is needed.
+syntax = "proto3";
+
+package distdb.kv.v1;
+
+option java_package = "io.distdb.rpc.proto";
+option java_multiple_files = true;
+option java_outer_classname = "TxnProto";
+
+message Mutation {
+  enum Op {
+    PUT = 0;
+    DELETE = 1;
+  }
+  Op op = 1;
+  bytes key = 2;
+  bytes value = 3;
+}
+
+// The lock a prewrite leaves on a key, until the transaction commits or rolls back there.
+message LockInfo {
+  bytes key = 1;
+  // The transaction's primary key: its state is the transaction's state.
+  bytes primary = 2;
+  uint64 start_ts = 3;
+  // After this long (measured on timestamps), a reader may roll the transaction back.
+  uint64 ttl_ms = 4;
+  Mutation.Op op = 5;
+}
+
+// key@commit_ts in the write column: the version written at start_ts became visible at
+// commit_ts. A ROLLBACK record sits at key@start_ts and forbids that transaction to commit.
+message WriteRecord {
+  enum Kind {
+    PUT = 0;
+    DELETE = 1;
+    ROLLBACK = 2;
+  }
+  Kind kind = 1;
+  uint64 start_ts = 2;
+}
+
+// The value of key as of read_ts. KeyLocked if a transaction that started at or before read_ts
+// holds a lock on it: the reader must resolve that lock first.
+message TxnGetRequest {
+  bytes key = 1;
+  uint64 read_ts = 2;
+}
+
+message TxnGetResponse {
+  bool found = 1;
+  bytes value = 2;
+}
+
+// Up to limit entries of [start_key, end_key) as of read_ts, within one range.
+message TxnScanRequest {
+  bytes start_key = 1;
+  optional bytes end_key = 2;
+  uint64 read_ts = 3;
+  uint32 limit = 4;
+}
+
+message TxnEntry {
+  bytes key = 1;
+  bytes value = 2;
+}
+
+message TxnScanResponse {
+  repeated TxnEntry entries = 1;
+  optional bytes resume_key = 2;
+}
+
+message PrewriteRequest {
+  Mutation mutation = 1;
+  bytes primary = 2;
+  uint64 start_ts = 3;
+  uint64 ttl_ms = 4;
+}
+
+message PrewriteResponse {}
+
+message TxnCommitRequest {
+  bytes key = 1;
+  uint64 start_ts = 2;
+  uint64 commit_ts = 3;
+}
+
+message TxnCommitResponse {}
+
+message TxnRollbackRequest {
+  bytes key = 1;
+  uint64 start_ts = 2;
+}
+
+message TxnRollbackResponse {}
+
+// Asked of a transaction's primary key by a reader that met one of its locks. A lock whose TTL
+// ran out by current_ts (or older than the range's floor) is rolled back, and the answer says so.
+message CheckTxnStatusRequest {
+  bytes primary = 1;
+  uint64 start_ts = 2;
+  uint64 current_ts = 3;
+}
+
+message CheckTxnStatusResponse {
+  enum Status {
+    LOCKED = 0;
+    COMMITTED = 1;
+    ROLLED_BACK = 2;
+  }
+  Status status = 1;
+  uint64 commit_ts = 2;
+  uint64 ttl_ms = 3;
+}
+
+// The locks with start_ts below max_ts in [start_key, end of its range), for the GC worker.
+message ScanLocksRequest {
+  bytes start_key = 1;
+  uint64 max_ts = 2;
+  uint32 limit = 3;
+}
+
+message ScanLocksResponse {
+  repeated LockInfo locks = 1;
+  // Present if the page stopped before the end of the range.
+  optional bytes resume_key = 2;
+}
+
+// From now on, the range holding key refuses prewrites below floor (it never goes down).
+message SetTxnFloorRequest {
+  bytes key = 1;
+  uint64 floor = 2;
+}
+
+message SetTxnFloorResponse {
+  uint64 floor = 1;
+  // Where the range that applied it ends (absent: the end of the key space), so a walk over
+  // every range knows where to go on.
+  optional bytes range_end = 2;
+}
+
+message KeyLocked {
+  LockInfo lock = 1;
+}
+
+// A transaction committed a write to this key after this one started: first committer wins.
+message WriteConflict {
+  uint64 conflict_commit_ts = 1;
+}
+
+// This transaction was rolled back (by a reader that found it dead, say) and can't commit.
+message TxnAborted {}
+
+// A rollback was asked for a transaction that had already committed here, at commit_ts.
+message TxnCommitted {
+  uint64 commit_ts = 1;
+}
+
+// The timestamp is below the range's floor or GC safe point: start the transaction again.
+message TxnTooOld {
+  uint64 floor = 1;
+}

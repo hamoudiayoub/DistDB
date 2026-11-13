@@ -17,7 +17,22 @@ message Command {
     WriteCommand write = 1;
     ExpireSessions expire_sessions = 2;
     SplitCommand split = 3;
+    TxnCommand txn = 4;
+    GcCommand gc = 5;
   }
+}
+
+// A transactional command (prewrite, commit, rollback, check status, set floor), decided when
+// applied. proposal_id lets the proposing leader match the result to its waiting client.
+message TxnCommand {
+  KvRequest request = 1;
+  uint64 proposal_id = 2;
+  int64 propose_time_millis = 3;
+}
+
+// Drop versions no transaction can read any more: below the safe point, keep only the newest.
+message GcCommand {
+  uint64 safe_point = 1;
 }
 
 // Split the range at split_key: it keeps [start, split_key), and a new range new_range_id gets

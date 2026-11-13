@@ -90,6 +90,8 @@ public final class KvStateMachine {
           result = new Applied(e.index(), w.request(), w.response(), w.effect());
         }
         case SPLIT -> throw new IllegalStateException("a single group cannot split");
+        case TXN, GC ->
+            throw new IllegalStateException("a single group has no transactions: " + e.index());
         case EXPIRE_SESSIONS ->
             sessions.expire(
                 batch,

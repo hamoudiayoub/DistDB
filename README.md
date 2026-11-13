@@ -15,8 +15,9 @@ placeholder name.)
 | 4     | Raft library and the deterministic simulator                 | done    |
 | 5     | Replicated KV service, linearizable, checked under faults    | done    |
 | 6     | Multi-Raft and sharding: ranges, placement driver, splits    | done    |
-| 7     | Percolator transactions, snapshot isolation                  | next    |
-| 8–10  | SQL, distributed execution, hardening                        | planned |
+| 7     | Percolator transactions, snapshot isolation                  | done    |
+| 8     | SQL: parser, planner, executor, PostgreSQL wire protocol     | next    |
+| 9–10  | Distributed execution, hardening                             | planned |
 
 Phase 2's gate, run at full scale:
 
@@ -55,6 +56,16 @@ seven real processes. CI runs 20 seeds; the gate is 500:
 
 ```bash
 ./gradlew :distdb-sim:test --tests '*ShardedKvSimulationTest' -Ddistdb.sim.shardSeeds=500
+```
+
+Phase 7's gate is `BankSimulationTest`: the same sharded cluster, faults, splits and moves, running
+bank transfers in transactions, while clients are killed mid-commit and GC drops old versions.
+Every audit (one snapshot of every account) must hold exactly the money the bank opened with.
+`TxnAnomalyTest` checks snapshot isolation anomaly by anomaly: no dirty reads, lost updates or
+read skew; write skew allowed. CI runs 20 seeds; the gate is 2,000:
+
+```bash
+./gradlew :distdb-sim:test --tests '*BankSimulationTest' -Ddistdb.sim.bankSeeds=2000
 ```
 
 ## Try it
@@ -133,9 +144,9 @@ distdb-storage  LSM engine                                  (Phase 2)
 distdb-raft     Raft as a pure state machine, no I/O        (Phase 4)
 distdb-rpc      protos, KvChannel/KvHandler, PdClient, gRPC (Phases 3, 5, 6)
 distdb-kv       Store (many ranges), ReplicatedKv, RaftStore (Phases 3-6)
-distdb-pd       placement driver; the TSO joins in Phase 7  (Phase 6)
+distdb-pd       placement driver and timestamp oracle       (Phases 6, 7)
 distdb-client   KvClient: retries, redirects, range cache   (Phases 3, 5, 6)
-distdb-txn      Percolator transactions                     (Phase 7)
+distdb-txn      TxnClient, Txn, GC worker (Percolator)      (Phase 7)
 distdb-sql      parser, planner, executor                   (Phases 8-9)
 distdb-pgwire   PostgreSQL wire protocol                    (Phase 8)
 distdb-server   the distdb binary: node, pd, kv, ranges     (Phases 3, 6, 10)

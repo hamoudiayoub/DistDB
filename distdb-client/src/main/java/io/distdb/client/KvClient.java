@@ -258,6 +258,17 @@ public final class KvClient implements AutoCloseable {
     return scanFrom(start, end, limit, deadline(timeout), new ArrayList<>());
   }
 
+  /**
+   * Sends {@code request} to the range holding its key, retrying whatever is worth retrying (leader
+   * changes, splits, lost messages) until {@code timeout}, and returns the answer, transactional
+   * errors included ({@code KeyLocked}, {@code WriteConflict}, ...). For the transaction layer: its
+   * commands are idempotent and carry no request id, so a retry is always safe. A scan of either
+   * kind is cut at the end of the range, with a resume key there.
+   */
+  public CompletableFuture<KvResponse> send(KvRequest request, Duration timeout) {
+    return new Call(request, false, deadline(timeout)).start();
+  }
+
   /** Waits for {@code future} and returns its value, rethrowing a failure as its KvException. */
   public static <T> T await(CompletableFuture<T> future) {
     try {
@@ -421,14 +432,21 @@ public final class KvClient implements AutoCloseable {
             RangeHeader.newBuilder()
                 .setRangeId(route.desc.getRangeId())
                 .setVersion(route.desc.getVersion()));
-        if (request.hasScan() && route.desc.hasEndKey()) {
+        if (route.desc.hasEndKey()) {
           ByteString end = route.desc.getEndKey();
-          if (!request.getScan().hasEndKey()
-              || ByteString.unsignedLexicographicalComparator()
-                      .compare(request.getScan().getEndKey(), end)
-                  > 0) {
+          var beyond = ByteString.unsignedLexicographicalComparator();
+          if (request.hasScan()
+              && (!request.getScan().hasEndKey()
+                  || beyond.compare(request.getScan().getEndKey(), end) > 0)) {
             r.setScan(request.getScan().toBuilder().setEndKey(end)); // one range at a time
             cutAt = end;
+          } else if (request.hasTxnScan()
+              && (!request.getTxnScan().hasEndKey()
+                  || beyond.compare(request.getTxnScan().getEndKey(), end) > 0)) {
+            r.setTxnScan(request.getTxnScan().toBuilder().setEndKey(end));
+            cutAt = end;
+          } else if (request.hasScanLocks()) {
+            cutAt = end; // the node scans to the end of its range
           }
         }
       }
@@ -469,12 +487,24 @@ public final class KvClient implements AutoCloseable {
         return;
       }
       if (!response.hasError()) {
-        if (cutAt != null && response.hasScan() && !response.getScan().hasResumeKey()) {
+        if (cutAt != null) {
           // The page reached the end of this range: the scan goes on in the next one.
-          response =
-              response.toBuilder()
-                  .setScan(response.getScan().toBuilder().setResumeKey(cutAt))
-                  .build();
+          if (response.hasScan() && !response.getScan().hasResumeKey()) {
+            response =
+                response.toBuilder()
+                    .setScan(response.getScan().toBuilder().setResumeKey(cutAt))
+                    .build();
+          } else if (response.hasTxnScan() && !response.getTxnScan().hasResumeKey()) {
+            response =
+                response.toBuilder()
+                    .setTxnScan(response.getTxnScan().toBuilder().setResumeKey(cutAt))
+                    .build();
+          } else if (response.hasScanLocks() && !response.getScanLocks().hasResumeKey()) {
+            response =
+                response.toBuilder()
+                    .setScanLocks(response.getScanLocks().toBuilder().setResumeKey(cutAt))
+                    .build();
+          }
         }
         result.complete(response);
         return;
@@ -526,6 +556,9 @@ public final class KvClient implements AutoCloseable {
             retryLater();
           }
         }
+        // Transactional answers: decided by the range, for the transaction layer to act on.
+        case KEY_LOCKED, WRITE_CONFLICT, TXN_ABORTED, TXN_COMMITTED, TXN_TOO_OLD ->
+            result.complete(response);
         case INVALID_ARGUMENT -> fail(KvException.Code.INVALID_ARGUMENT, error.getMessage(), null);
         case STALE_REQUEST, KIND_NOT_SET ->
             fail(KvException.Code.INTERNAL, "unexpected error from server: " + lastFailure, null);
@@ -572,6 +605,14 @@ public final class KvClient implements AutoCloseable {
       case DELETE -> request.getDelete().getKey().toByteArray();
       case CPUT -> request.getCput().getKey().toByteArray();
       case SCAN -> request.getScan().getStartKey().toByteArray();
+      case TXN_GET -> request.getTxnGet().getKey().toByteArray();
+      case TXN_SCAN -> request.getTxnScan().getStartKey().toByteArray();
+      case SCAN_LOCKS -> request.getScanLocks().getStartKey().toByteArray();
+      case PREWRITE -> request.getPrewrite().getMutation().getKey().toByteArray();
+      case TXN_COMMIT -> request.getTxnCommit().getKey().toByteArray();
+      case TXN_ROLLBACK -> request.getTxnRollback().getKey().toByteArray();
+      case CHECK_TXN_STATUS -> request.getCheckTxnStatus().getPrimary().toByteArray();
+      case SET_TXN_FLOOR -> request.getSetTxnFloor().getKey().toByteArray();
       default -> throw new IllegalArgumentException("no key in " + request.getOpCase());
     };
   }

@@ -8,6 +8,7 @@ syntax = "proto3";
 package distdb.kv.v1;
 
 import "distdb/kv/v1/pd.proto";
+import "distdb/kv/v1/txn.proto";
 
 option java_package = "io.distdb.rpc.proto";
 option java_multiple_files = true;
@@ -42,6 +43,15 @@ message KvRequest {
     DeleteRequest delete = 12;
     ScanRequest scan = 13;
     ConditionalPutRequest cput = 14;
+    // Transactions (Percolator); see txn.proto.
+    TxnGetRequest txn_get = 15;
+    TxnScanRequest txn_scan = 16;
+    PrewriteRequest prewrite = 17;
+    TxnCommitRequest txn_commit = 18;
+    TxnRollbackRequest txn_rollback = 19;
+    CheckTxnStatusRequest check_txn_status = 21;
+    ScanLocksRequest scan_locks = 22;
+    SetTxnFloorRequest set_txn_floor = 23;
     // For the placement driver; see pd.proto.
     PdRequest pd = 20;
   }
@@ -83,6 +93,14 @@ message KvResponse {
     DeleteResponse delete = 12;
     ScanResponse scan = 13;
     ConditionalPutResponse cput = 14;
+    TxnGetResponse txn_get = 15;
+    TxnScanResponse txn_scan = 16;
+    PrewriteResponse prewrite = 17;
+    TxnCommitResponse txn_commit = 18;
+    TxnRollbackResponse txn_rollback = 19;
+    CheckTxnStatusResponse check_txn_status = 21;
+    ScanLocksResponse scan_locks = 22;
+    SetTxnFloorResponse set_txn_floor = 23;
     PdResponse pd = 20;
   }
 }
@@ -122,7 +140,7 @@ message KeyValue {
 
 // Errors the server decided on. Each kind tells the client exactly what to do next, which is why
 // they are typed rather than strings. Apart from StorageFailure.maybe_applied, this attempt
-// changed nothing. (KeyLocked joins in Phase 7.)
+// changed nothing. (The transactional ones are in txn.proto.)
 message Error {
   oneof kind {
     // Too many requests in flight. Retry after a backoff.
@@ -143,6 +161,12 @@ message Error {
     // The range changed (it split, so the key may be elsewhere) since the client looked it up.
     // Ask the PD again.
     EpochMismatch epoch_mismatch = 8;
+    // Transactions; see txn.proto. Each says this attempt changed nothing.
+    KeyLocked key_locked = 9;
+    WriteConflict write_conflict = 10;
+    TxnAborted txn_aborted = 11;
+    TxnCommitted txn_committed = 12;
+    TxnTooOld txn_too_old = 13;
   }
   string message = 15;
 }

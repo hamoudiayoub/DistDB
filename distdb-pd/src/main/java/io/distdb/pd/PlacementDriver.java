@@ -25,9 +25,11 @@ import io.distdb.rpc.proto.RangeDescriptor;
 import io.distdb.rpc.proto.RangeInfo;
 import io.distdb.rpc.proto.RangeReport;
 import io.distdb.rpc.proto.ReplicaProgress;
+import io.distdb.rpc.proto.SetGcSafePointResponse;
 import io.distdb.rpc.proto.SplitOperator;
 import io.distdb.rpc.proto.StoreHeartbeat;
 import io.distdb.rpc.proto.StoreHeartbeatResponse;
+import io.distdb.rpc.proto.TsoResponse;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -69,6 +71,10 @@ public final class PlacementDriver implements KvHandler, AutoCloseable {
   private static final byte[] NEXT_RANGE_ID = "pd/next-range-id".getBytes(StandardCharsets.UTF_8);
   private static final long ID_BLOCK = 100;
   private static final long FIRST_ID = 2; // range 1 is the one the founders bootstrap
+  private static final byte[] TSO_LIMIT = "pd/tso-limit".getBytes(StandardCharsets.UTF_8);
+  private static final byte[] GC_SAFE_POINT = "pd/gc-safe-point".getBytes(StandardCharsets.UTF_8);
+  private static final long TSO_WINDOW_MS = 3000;
+  private static final int LOGICAL_BITS = 18;
 
   /**
    * How the PD places ranges.
@@ -167,6 +173,10 @@ public final class PlacementDriver implements KvHandler, AutoCloseable {
   private long idLimit;
   private boolean allocating;
   private boolean scheduling = true;
+  private long tsoLimitMs = -1; // the timestamp limit this node owns, in ms; -1: none
+  private long tsoPhysical;
+  private long tsoLogical;
+  private long gcSafePoint;
   private long started;
   private long done;
   private long timedOut;
@@ -199,7 +209,11 @@ public final class PlacementDriver implements KvHandler, AutoCloseable {
     if (!request.hasPd()) {
       return kv.handle(request, deadlineNanos); // the PD group's own data
     }
-    return CompletableFuture.completedFuture(handlePd(request.getPd()));
+    return switch (request.getPd().getKindCase()) {
+      case TSO -> tso(request.getPd().getTso().getCount());
+      case SET_GC_SAFE_POINT -> setGcSafePoint(request.getPd().getSetGcSafePoint().getSafePoint());
+      default -> CompletableFuture.completedFuture(handlePd(request.getPd()));
+    };
   }
 
   private synchronized KvResponse handlePd(PdRequest request) {
@@ -221,12 +235,28 @@ public final class PlacementDriver implements KvHandler, AutoCloseable {
       stores.clear();
       operators.clear();
       stuckLearners.clear();
+      refreshSafePoint();
     }
     PdResponse.Builder response = PdResponse.newBuilder();
     switch (request.getKindCase()) {
       case HEARTBEAT -> response.setHeartbeat(onHeartbeat(request.getHeartbeat()));
       case LOCATE -> response.setLocate(locate(request.getLocate().getKey().toByteArray()));
       case LIST_RANGES -> response.setListRanges(list());
+      case GET_RANGE -> {
+        RangeState st = ranges.get(request.getGetRange().getRangeId());
+        LocateResponse.Builder out = LocateResponse.newBuilder();
+        if (st != null) {
+          out.setFound(true).setRange(info(st));
+          for (int n : members(st.desc)) {
+            StoreState store = stores.get(new NodeId(n));
+            if (store != null) {
+              out.putAddresses(n, store.address());
+            }
+          }
+        }
+        response.setGetRange(out);
+      }
+      case TSO, SET_GC_SAFE_POINT -> throw new IllegalStateException("answered asynchronously");
       case KIND_NOT_SET -> {
         return KvErrors.invalidArgument("empty PD request");
       }
@@ -251,6 +281,7 @@ public final class PlacementDriver implements KvHandler, AutoCloseable {
     }
     ensureIds();
     stores.forEach((id, st) -> out.putStores(id.value(), st.address()));
+    out.setGcSafePoint(gcSafePoint);
     return out.build();
   }
 
@@ -545,6 +576,132 @@ public final class PlacementDriver implements KvHandler, AutoCloseable {
     List<Integer> out = new ArrayList<>(d.getVotersList());
     out.addAll(d.getLearnersList());
     return out;
+  }
+
+  // -----------------------------------------------------------------------------------------------
+  // The timestamp oracle and the GC safe point
+
+  /**
+   * Hands out {@code count} timestamps, {@code physical_ms << 18 | logical}, strictly increasing.
+   *
+   * <p>This node may issue only below a limit (in ms) that it owns in the PD group's replicated
+   * state, moved forward by conditional puts: two nodes that both believe they lead can't both move
+   * the same limit, so their timestamps never overlap. And each request first reads the limit
+   * linearizably and checks it still owns it, so a deposed leader cannot hand out a timestamp
+   * smaller than one the new leader already issued: a transaction that begins after another
+   * committed always gets a start above that commit.
+   */
+  private CompletableFuture<KvResponse> tso(int count) {
+    if (!isLeader()) {
+      return CompletableFuture.completedFuture(notLeader());
+    }
+    if (count < 1 || count > 1 << 16) {
+      return CompletableFuture.completedFuture(
+          KvErrors.invalidArgument("can't hand out " + count + " timestamps at once"));
+    }
+    return local
+        .get(TSO_LIMIT)
+        .thenCompose(current -> {
+          long value = current.map(PlacementDriver::readLong).orElse(0L);
+          long now = clock.wallTimeMillis();
+          synchronized (this) {
+            if (value == tsoLimitMs && now + TSO_WINDOW_MS / 3 < tsoLimitMs) {
+              return CompletableFuture.completedFuture(issue(count));
+            }
+          }
+          // Take the limit over, or move it forward: from what we read to a few seconds ahead.
+          long next = Math.max(value, now) + TSO_WINDOW_MS;
+          return local
+              .conditionalPut(TSO_LIMIT, longBytes(next), current, Duration.ofSeconds(2))
+              .thenApply(ok -> {
+                synchronized (this) {
+                  if (!ok) {
+                    return KvErrors.serverBusy("the timestamp limit moved under us; ask again");
+                  }
+                  if (value != tsoLimitMs) {
+                    // Newly ours: whoever held it issued only below value.
+                    tsoPhysical = Math.max(tsoPhysical, value);
+                    tsoLogical = 0;
+                  }
+                  tsoLimitMs = next;
+                  return issue(count);
+                }
+              });
+        })
+        .exceptionally(t -> KvErrors.serverBusy("the timestamp oracle is not ready: " + t));
+  }
+
+  private KvResponse issue(int count) {
+    long now = clock.wallTimeMillis();
+    if (now > tsoPhysical) {
+      tsoPhysical = now;
+      tsoLogical = 0;
+    }
+    if (tsoLogical + count >= 1L << LOGICAL_BITS) {
+      tsoPhysical++;
+      tsoLogical = 0;
+    }
+    if (tsoPhysical >= tsoLimitMs) {
+      return KvErrors.serverBusy("the timestamp limit is reached; ask again");
+    }
+    long first = tsoPhysical << LOGICAL_BITS | tsoLogical;
+    tsoLogical += count;
+    return KvResponse.newBuilder()
+        .setPd(
+            PdResponse.newBuilder()
+                .setTso(TsoResponse.newBuilder().setFirst(first).setCount(count)))
+        .build();
+  }
+
+  /** Raises the GC safe point (replicated, so it never goes down) and answers with its value. */
+  private CompletableFuture<KvResponse> setGcSafePoint(long proposed) {
+    if (!isLeader()) {
+      return CompletableFuture.completedFuture(notLeader());
+    }
+    return local
+        .get(GC_SAFE_POINT)
+        .thenCompose(current -> {
+          long value = current.map(PlacementDriver::readLong).orElse(0L);
+          if (proposed <= value) {
+            return CompletableFuture.completedFuture(value);
+          }
+          return local
+              .conditionalPut(GC_SAFE_POINT, longBytes(proposed), current, Duration.ofSeconds(2))
+              .thenApply(ok -> ok ? proposed : value);
+        })
+        .thenApply(value -> {
+          synchronized (this) {
+            gcSafePoint = Math.max(gcSafePoint, value);
+          }
+          return KvResponse.newBuilder()
+              .setPd(
+                  PdResponse.newBuilder()
+                      .setSetGcSafePoint(SetGcSafePointResponse.newBuilder().setSafePoint(value)))
+              .build();
+        })
+        .exceptionally(t -> KvErrors.serverBusy("could not store the safe point: " + t));
+  }
+
+  /** A new leader learns the safe point from the replicated state; until then it says 0. */
+  private void refreshSafePoint() {
+    local
+        .get(GC_SAFE_POINT)
+        .thenAccept(current -> {
+          synchronized (this) {
+            gcSafePoint = Math.max(gcSafePoint, current.map(PlacementDriver::readLong).orElse(0L));
+          }
+        });
+  }
+
+  private KvResponse notLeader() {
+    RaftNode.Status s = kv.raftStatus();
+    NodeId leader = s.leader();
+    boolean known = leader != null && !leader.equals(config.self());
+    return KvErrors.notLeader(
+        known ? leader.value() : 0,
+        known ? config.peers().getOrDefault(leader, "") : "",
+        false,
+        config.self() + " is not the PD leader");
   }
 
   // -----------------------------------------------------------------------------------------------

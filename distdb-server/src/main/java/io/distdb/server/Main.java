@@ -21,7 +21,7 @@ public final class Main {
       A sharded cluster: a placement driver of three nodes, and data nodes that it fills.
 
         distdb pd --data-dir DIR --id N --peers 1=HOST:PORT,2=HOST:PORT,3=HOST:PORT
-                  [--split-keys N] [--dead-after DURATION]
+                  [--split-keys N] [--dead-after DURATION] [--gc-lifetime DURATION]
             Run node N of the placement driver; it listens on its own entry in --peers.
 
         distdb node --data-dir DIR --id N --listen HOST:PORT --pd PD_ADDRESSES [--founders 1,2,3]

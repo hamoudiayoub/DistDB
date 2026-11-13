@@ -6,7 +6,7 @@ ranges, and any node answers SQL from `psql`. It is built bottom-up in ten phase
 ends at a **gate**, a test that proves it works, and leaves a design note in `docs/design/`.
 
 This document explains what each phase does, how it works, and what to learn from it.
-**Phases 1–6 are built** (with their measured results); **phases 7–10 are the plan.**
+**Phases 1–7 are built** (with their measured results); **phases 8–10 are the plan.**
 
 ```
  SQL (8, 9)      psql ─▶ pgwire ─▶ parser ─▶ planner ─▶ distributed executor
@@ -361,43 +361,76 @@ index. The fix: a replica created again does not vote until its log is as long a
 
 ---
 
-## Phase 7: Distributed transactions *(planned)*
+## Phase 7: Distributed transactions
 
 **Goal.** ACID transactions with **snapshot isolation** across any number of ranges, following
-Google's Percolator (as TiDB does).
+Google's Percolator (as TiDB does): a transfer debits one account and credits another, in two
+ranges, and either both happen or neither does, whatever crashes.
 
-**What it will build.**
-- **Timestamp oracle (TSO)** in the PD leader. It hands out strictly increasing 64-bit timestamps
-  (physical milliseconds plus a logical counter) and persists a high-water mark a few seconds
-  ahead through Raft, so a new PD leader never reissues one. Clients fetch timestamps in batches.
-- **Three column families per key,** built on the Phase 2 MVCC keys:
-  - **data** `key@start_ts` → value;
-  - **lock** `key` → (primary key, start_ts, TTL);
-  - **write** `key@commit_ts` → start_ts.
-- **The commit protocol:**
-  1. **Begin:** take a `start_ts`. Reads see the latest write with `commit_ts ≤ start_ts`.
-     Writes are buffered on the client.
-  2. **Prewrite:** pick one key as **primary**. For every key, fail if there is a newer write
-     (write-write conflict) or another lock; otherwise write data and lock.
-  3. **Commit:** take a `commit_ts`, then write the primary's write record and remove its lock,
-     atomically. **That single write is the commit point.**
-  4. Commit the secondary keys asynchronously.
-- **Lock resolution:** a reader that meets a lock follows it to the primary. If the primary
-  committed, the reader rolls the lock forward. If the lock's TTL expired uncommitted, it rolls
-  the transaction back. No coordinator log is needed.
-- **Garbage collection:** the PD tracks a safe point (the oldest timestamp any transaction may
-  read), and older versions are removed.
+**What it builds.**
+- **A timestamp oracle (TSO)** in the PD leader: `physical_ms << 18 | logical`, strictly
+  increasing, handed out in batches. The leader issues only below a limit it owns in the PD's
+  replicated state (moved forward by conditional puts), and each batch first re-reads that limit
+  linearizably, so a deposed leader can't issue a timestamp below one already issued.
+- **Three column families per key**, inside every range's span, on Phase 2's `MvccKey`:
+  data `key@start_ts`, lock `key`, write `key@commit_ts`. Splits, snapshots and replica removal
+  carry them like any other data.
+- **Percolator commands**, applied through each range's Raft log, all idempotent (no request ids):
+  `Prewrite`, `Commit`, `Rollback`, `CheckTxnStatus`, and for GC `SetTxnFloor`, `ScanLocks`, `Gc`.
+- **`TxnClient` and `Txn`** (`distdb-txn`): begin, get, scan, put, delete, commit, with retries for
+  conflicts. The commit prewrites every key, takes a commit timestamp, commits the primary (the
+  commit point), then the secondaries in the background.
+- **Lock resolution:** a reader that meets a lock asks the lock's primary how the transaction
+  ended, and rolls the lock forward or back. An expired lock is rolled back by whoever asks.
+- **Garbage collection** by a GC worker on the PD leader: set a floor on every range (no
+  prewrites below it), resolve every lock below it, then publish the safe point; ranges drop the
+  versions nobody can read.
+
+**How it works, in one example.** Transfer 10 from account A (range 1) to B (range 2). Begin:
+`start_ts = 100`. Read A = 50 and B = 70 at 100. Commit: prewrite A (the primary) with 40 and B
+with 80, each a lock plus data at 100. Take `commit_ts = 105`. Commit A: write record
+`A@105 → 100`, lock removed. **The transfer is now committed**, even if the client dies this
+instant. A reader at 110 that finds B's lock asks A's range: committed at 105. So it writes
+`B@105 → 100` itself and reads 80. Had the client died before committing A, the reader would have
+found A's lock expired, rolled A back (leaving a ROLLBACK record so a late prewrite is refused),
+then rolled B back: no money moved.
 
 **Concepts to learn.** ACID; isolation levels and their anomalies (dirty read, lost update, read
-skew, write skew); MVCC; two-phase commit and why it blocks; why the primary key removes the
-need for a coordinator; timestamps vs hybrid logical clocks. *Read:* the Percolator paper, and
-DDIA chapters 7 and 9.
+skew, write skew); MVCC; two-phase commit and why it blocks; why Percolator's primary key removes
+the coordinator; why rollback records exist; timestamps vs hybrid logical clocks; why GC must
+resolve locks first. *Read:* the Percolator paper, and DDIA chapters 7 and 9.
 
-**Gate.**
-- **The bank test:** concurrent transfers between accounts under faults never change the total,
-  across thousands of seeds.
-- **Anomaly tests:** snapshot isolation allows exactly the anomalies it should (write skew) and
-  forbids the rest.
+**How it's tested.**
+- **`BankSimulationTest` (the gate):** Phase 6's cluster and faults (partitions, power cuts of
+  data nodes and the PD leader, disk failures, stalls, forced splits and moves), with bank
+  clients: transfers between random accounts, and audits (a read-only transaction reading every
+  account). One transaction in twenty has its client killed after its prewrites, or right after
+  its commit point. GC runs with a lifetime of 2 to 5 seconds. Every audit, and a final one, must
+  find exactly the money the bank opened with, no account negative; replicas must converge and
+  every client must make progress after the faults.
+- **`TxnAnomalyTest`:** no dirty reads, no lost updates, no read skew, transactions see everything
+  that committed before they began, a reader finishes a transaction whose client died after its
+  commit point, and **write skew is allowed** (two transactions keep `x + y >= 1` on their own
+  snapshots and break it together).
+- **`PercolatorTest`:** each command's rules on one engine.
+
+**Gate.** **2,000 seeds:** 144,429 transfers committed and 50,701 audits balanced, while
+2,142 clients were killed mid-commit, ranges split 13,601 times and changed membership 369,687
+times, and GC ran 16,843 rounds; through 10,496 power cuts (2,481 of the PD leader), 4,590 disk
+failures and 10,556 partitions. No audit was ever off by a unit.
+- Of seven bugs planted on purpose, the simulation caught all seven (two only after more than a
+  hundred seeds), and the unit tests four of them.
+- The runs found three bugs in Phase 6's replica lifecycle (stale stamps and orphaned replicas),
+  not in the transaction code.
+
+*Passed.* (This phase is not committed yet.)
+
+**Lessons.**
+- The primary key's write record *is* the transaction's outcome. Everything else (secondaries,
+  readers' roll-forwards, rollback records) follows from protecting that one fact.
+- GC can destroy information a protocol depends on: the primary's commit record. Hence the floor,
+  then lock resolution, then the safe point.
+- A version number on a message must describe when the message was made, not when it was sent.
 
 ---
 

@@ -325,3 +325,58 @@ One entry per bug that took more than an hour: symptom, root cause, what it taug
   with at least the log behind every promise made before. Also, the end-of-run checks only saw a
   symptom; checking the core property continuously found the moment it broke. That check stays in
   the gate.
+
+---
+
+## 2026-11-12 — A message stamped with the configuration that removed its receiver
+
+- **Symptom:** while checking planted transaction bugs, two runs failed for an unrelated reason:
+  a learner that never initialized. A 100-seed bank run then reproduced it without any planted
+  bug (seed 33). The node held an orphan replica of the old range, with a stale, wider span, that
+  blocked the learner's snapshot. The orphan kept campaigning, the members kept answering
+  `Removed`, and it ignored them.
+- **Cause:** Phase 6's guard against stale notices. A replica ignores a `Removed` notice if a
+  leader whose configuration is at least as new has sent to it, because that means it is being
+  added back. The store stamped every outgoing message with the sender's configuration index *at
+  the moment the batch was sent*. A leader had queued a heartbeat to n4, then appended the change
+  that removed n4 (index 69), then sent the batch: n4 received a message stamped 69. Its own
+  removal had become its proof of membership.
+- **Fix:** a message carries the configuration index only if that configuration counts its
+  receiver, and 0 otherwise. Planted back as mutation S11.
+- **Also found in the same hunt:** an orphan whose old configuration's members no longer host the
+  range at all gets no answer from anyone. A replica that has heard from no leader for 3 seconds
+  now asks the PD who the range's members are, and probes them; they answer `Removed` under the
+  usual rule (the PD only says whom to ask).
+- **And once more (the 2,000-seed gate, seed 823):** an orphaned *learner* was never probed.
+  Learners never campaign, so it kept believing in its old leader, and the probe fired only for
+  replicas with no leader. The probe now fires for any replica that no leader has sent to for 3
+  seconds, whatever it believes.
+- **Lesson:** a timestamp or version attached to a message must describe the moment the message
+  was made, not the moment it left. Batching moved the two apart.
+
+---
+
+## 2026-11-12 — The bank's convergence check raced with GC
+
+- **Symptom:** bank seed 8 failed the final check: one replica of a range held one more version
+  of an account than the other two.
+- **Cause:** not a bug. That replica was one entry behind, and the entry was a GC command: the GC
+  worker kept raising the safe point during the settle period, and each new safe point is a log
+  entry on every range. The comparison needs a quiet cluster.
+- **Fix:** the run stops the GC workers along with the clients, before it compares replicas.
+- **Lesson:** "converged" is only defined once nothing more is being written. Every background job
+  that writes (GC, session expiry, rebalancing) has to be stopped before the check.
+
+---
+
+## 2026-11-12 — Transactions need the oracle twice, and partitions show it
+
+- **Symptom:** the first bank runs committed few transfers during the fault period: clients sat
+  idle for seconds at a time, with "no timestamp in time".
+- **Cause:** not a bug. Every transaction takes two timestamps, and each needs a linearizable
+  read in the PD group to prove the PD node still owns the timestamp range. A partition that cuts
+  a client, or the PD leader, off from a PD majority stops every transaction of that client. A
+  single-key write, in contrast, only needs the PD when its range cache misses.
+- **Lesson:** the timestamp oracle is a single point of *availability* (never of safety). Systems
+  built on Percolator work around it: batching (done here), caching a lease, or hybrid logical
+  clocks instead of a central oracle (CockroachDB's choice).

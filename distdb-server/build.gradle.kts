@@ -8,6 +8,7 @@ dependencies {
   implementation(project(":distdb-kv"))
   implementation(project(":distdb-pd"))
   implementation(project(":distdb-client"))
+  implementation(project(":distdb-txn"))
 }
 
 application {
